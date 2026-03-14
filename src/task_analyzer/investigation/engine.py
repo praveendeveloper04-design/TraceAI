@@ -1,20 +1,24 @@
 """
 Investigation Engine — LangChain-powered AI reasoning for task investigation.
 
-This is the core of Task Analyzer. It orchestrates:
+This is the core of TraceAI. It orchestrates:
 
   1. Task ingestion from the configured ticket source
   2. Repository context building from the project knowledge profile
-  3. Optional tool usage (database queries, log retrieval, doc search)
-  4. Multi-step AI reasoning using Claude via LangChain
-  5. Structured investigation report generation
+  3. Skill execution (repo analysis, ticket context, log analysis, DB analysis)
+  4. Evidence aggregation and root cause ranking
+  5. Multi-step AI reasoning using Claude via LangChain
+  6. Structured investigation report generation
 
-The engine uses LangChain's agent framework with tool calling to let
-Claude decide which tools to invoke during an investigation.
+Security: Every operation goes through:
+  1. SecurityGuard.validate_tool() — tool permission check
+  2. RateLimiter.acquire() — rate limit enforcement
+  3. AuditLogger.log_tool_call() — audit trail
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Any
@@ -26,6 +30,12 @@ from langchain_core.tools import StructuredTool
 
 from task_analyzer.connectors.base.connector import BaseConnector
 from task_analyzer.connectors.base.registry import ConnectorRegistry
+from task_analyzer.core.audit_logger import AuditLogger
+from task_analyzer.core.rate_limiter import RateLimiter
+from task_analyzer.core.security_guard import SecurityGuard
+from task_analyzer.investigation.evidence_aggregator import EvidenceAggregator
+from task_analyzer.investigation.graph_engine import InvestigationGraph
+from task_analyzer.investigation.root_cause_engine import RootCauseEngine
 from task_analyzer.models.schemas import (
     InvestigationFinding,
     InvestigationReport,
@@ -35,6 +45,11 @@ from task_analyzer.models.schemas import (
     ProjectProfile,
     Task,
 )
+from task_analyzer.skills.database_analysis import DatabaseAnalysisSkill
+from task_analyzer.skills.log_analysis import LogAnalysisSkill
+from task_analyzer.skills.repo_analysis import RepoAnalysisSkill
+from task_analyzer.skills.skill_registry import SkillRegistry
+from task_analyzer.skills.ticket_context import TicketContextSkill
 
 logger = structlog.get_logger(__name__)
 
@@ -52,8 +67,10 @@ investigation report.
 2. **Analyze the Codebase**: Use the project knowledge profile to understand the architecture.
 3. **Use Available Tools**: If tools are available (database queries, documentation search,
    log retrieval), use them to gather evidence. Only use tools that are relevant.
-4. **Reason Step by Step**: Think through the problem methodically. Consider multiple hypotheses.
-5. **Produce Findings**: For each finding, state your confidence level and supporting evidence.
+4. **Review Skill Findings**: Pre-investigation skills have already gathered evidence.
+   Use their findings to inform your analysis.
+5. **Reason Step by Step**: Think through the problem methodically. Consider multiple hypotheses.
+6. **Produce Findings**: For each finding, state your confidence level and supporting evidence.
 
 ## Output Format
 
@@ -138,9 +155,11 @@ class InvestigationEngine:
     Orchestrates AI-powered task investigations using LangChain and Claude.
 
     The engine:
+      - Runs investigation skills (repo, ticket, log, database analysis)
       - Builds a rich context from the task, project profile, and connectors
       - Creates LangChain tools from configured connectors
       - Runs a multi-step reasoning chain with Claude
+      - Aggregates evidence and ranks root causes
       - Parses the output into a structured InvestigationReport
     """
 
@@ -161,15 +180,34 @@ class InvestigationEngine:
             max_tokens=config.llm_max_tokens,
         )
 
+        # Security, rate limiting, and audit logging
+        self.guard = SecurityGuard(safe_mode=(config.mode == "safe"))
+        self.rate_limiter = RateLimiter()
+        self.audit = AuditLogger()
+
+        # Attach rate limiter to all connectors
+        for name, connector in registry.get_all_instances().items():
+            connector.set_rate_limiter(self.rate_limiter)
+
+        # Initialize skill registry
+        self.skill_registry = SkillRegistry()
+        self.skill_registry.register(RepoAnalysisSkill())
+        self.skill_registry.register(TicketContextSkill())
+        self.skill_registry.register(LogAnalysisSkill())
+        self.skill_registry.register(DatabaseAnalysisSkill())
+
     async def investigate(self, task: Task) -> InvestigationReport:
         """
         Run a full investigation on a task.
 
         Steps:
-          1. Build context (task + project profile + connector context)
-          2. Create tools from active connectors
-          3. Run the LangChain agent
-          4. Parse and return the structured report
+          1. Initialize investigation graph
+          2. Run available skills (repo, ticket, log, database)
+          3. Aggregate evidence and rank root causes
+          4. Build context (task + profile + skill findings + connector context)
+          5. Create tools from active connectors
+          6. Run the LangChain agent
+          7. Parse and return the structured report
         """
         report = InvestigationReport(
             task_id=task.id,
@@ -178,44 +216,132 @@ class InvestigationEngine:
             model_used=self.config.llm_model,
         )
 
+        self.audit.log_investigation_start(task.id, task.title)
+
         try:
             start_time = time.time()
 
-            # Step 1: Build context
+            # Step 1: Initialize investigation graph
+            graph = InvestigationGraph()
+            graph.add_node(task.id, "ticket", {
+                "title": task.title,
+                "type": task.task_type.value,
+            })
+
+            # Step 2: Run available skills
             report.steps.append(InvestigationStep(
                 step_number=1,
-                action="Building investigation context",
-                reasoning="Gathering task details, project knowledge, and connector context",
+                action="Running investigation skills",
+                reasoning="Executing available skills to gather evidence before AI reasoning",
             ))
-            context = await self._build_context(task)
 
-            # Step 2: Create tools
+            connectors = self.registry.get_all_instances()
+            available_skills = self.skill_registry.list_available(connectors)
+            skill_results: dict[str, Any] = {}
+
+            skill_context = {"profiles": self.profiles}
+
+            for skill in available_skills:
+                skill_start = time.time()
+                try:
+                    result = await asyncio.wait_for(
+                        skill.run(
+                            task, skill_context, self.guard, connectors, graph
+                        ),
+                        timeout=30,
+                    )
+                    skill_results[skill.name] = result
+                    skill_elapsed = int((time.time() - skill_start) * 1000)
+                    self.audit.log_skill_execution(
+                        task.id, skill.name, "success",
+                        duration_ms=skill_elapsed,
+                        findings_count=len(result) if isinstance(result, dict) else 0,
+                    )
+                except asyncio.TimeoutError:
+                    skill_elapsed = int((time.time() - skill_start) * 1000)
+                    self.audit.log_skill_execution(
+                        task.id, skill.name, "timeout",
+                        duration_ms=skill_elapsed,
+                    )
+                    logger.warning(
+                        "skill_execution_timeout",
+                        skill=skill.name,
+                        task_id=task.id,
+                        timeout_s=30,
+                    )
+                except Exception as exc:
+                    skill_elapsed = int((time.time() - skill_start) * 1000)
+                    self.audit.log_skill_execution(
+                        task.id, skill.name, "failed",
+                        duration_ms=skill_elapsed,
+                    )
+                    logger.warning(
+                        "skill_execution_failed",
+                        skill=skill.name,
+                        task_id=task.id,
+                        error=str(exc),
+                    )
+
+            # Step 3: Aggregate evidence and rank root causes
+            report.steps.append(InvestigationStep(
+                step_number=2,
+                action="Aggregating evidence and ranking root causes",
+                reasoning="Consolidating skill findings into unified evidence structure",
+            ))
+
+            aggregator = EvidenceAggregator()
+            evidence = aggregator.aggregate(skill_results)
+
+            root_engine = RootCauseEngine()
+            hypotheses = root_engine.analyze(graph.export(), evidence)
+
+            # Step 4: Build context
+            report.steps.append(InvestigationStep(
+                step_number=3,
+                action="Building investigation context",
+                reasoning="Gathering task details, project knowledge, skill findings, and connector context",
+            ))
+            context = await self._build_context(task, evidence, aggregator)
+
+            # Step 5: Create tools
             tools = self._build_tools(task)
             tool_names = [t.name for t in tools]
             report.steps.append(InvestigationStep(
-                step_number=2,
+                step_number=4,
                 action="Preparing investigation tools",
                 reasoning=f"Available tools: {', '.join(tool_names) if tool_names else 'None'}",
             ))
 
-            # Step 3: Run the AI investigation
+            # Step 6: Run the AI investigation
             report.steps.append(InvestigationStep(
-                step_number=3,
+                step_number=5,
                 action="Running AI analysis",
                 tool_used="Claude via LangChain",
-                reasoning="Sending context and task to Claude for multi-step reasoning",
+                reasoning="Sending context, evidence, and task to Claude for multi-step reasoning",
             ))
 
             result = await self._run_investigation(context, tools)
 
-            # Step 4: Parse results
+            # Step 7: Parse results
             report.steps.append(InvestigationStep(
-                step_number=4,
+                step_number=6,
                 action="Parsing investigation results",
                 reasoning="Extracting structured findings from AI output",
             ))
 
             self._parse_result(result, report)
+
+            # Attach graph, hypotheses, and evidence to report
+            report.investigation_graph = graph.export()
+            report.root_cause_hypotheses = [
+                {
+                    "description": h.description,
+                    "evidence": h.evidence,
+                    "confidence": h.score,
+                }
+                for h in hypotheses
+            ]
+            report.evidence_summary = evidence
 
             elapsed_ms = int((time.time() - start_time) * 1000)
             report.status = InvestigationStatus.COMPLETED
@@ -223,10 +349,17 @@ class InvestigationEngine:
             for step in report.steps:
                 step.duration_ms = elapsed_ms // len(report.steps)
 
+            self.audit.log_investigation_complete(
+                task.id, report.status.value,
+                len(report.findings), elapsed_ms,
+            )
+
             logger.info(
                 "investigation_completed",
                 task_id=task.id,
                 findings=len(report.findings),
+                hypotheses=len(hypotheses),
+                graph_nodes=len(graph.nodes),
                 elapsed_ms=elapsed_ms,
             )
 
@@ -234,11 +367,20 @@ class InvestigationEngine:
             report.status = InvestigationStatus.FAILED
             report.error = str(exc)
             report.completed_at = datetime.utcnow()
+            self.audit.log_investigation_complete(
+                task.id, "failed", 0,
+                int((time.time() - start_time) * 1000) if 'start_time' in dir() else 0,
+            )
             logger.error("investigation_failed", task_id=task.id, error=str(exc))
 
         return report
 
-    async def _build_context(self, task: Task) -> str:
+    async def _build_context(
+        self,
+        task: Task,
+        evidence: dict | None = None,
+        aggregator: EvidenceAggregator | None = None,
+    ) -> str:
         """Assemble the full context for the investigation."""
         parts = [
             "# Task Under Investigation",
@@ -250,6 +392,12 @@ class InvestigationEngine:
             parts.append("\n# Project Knowledge")
             for profile in self.profiles:
                 parts.append(profile.context_summary)
+
+        # Add evidence summary from skills
+        if evidence and aggregator:
+            evidence_text = aggregator.summarize(evidence)
+            if evidence_text:
+                parts.append(f"\n# Pre-Investigation Evidence\n{evidence_text}")
 
         # Add connector context
         for name, connector in self.registry.get_all_instances().items():
