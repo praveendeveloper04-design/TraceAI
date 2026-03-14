@@ -6,6 +6,7 @@ Provides REST endpoints for:
   - Investigation triggering and status
   - Configuration management
   - Project profile access
+  - Health check for server liveness
 
 The VS Code extension communicates with this server over HTTP/WebSocket.
 """
@@ -26,7 +27,7 @@ from task_analyzer import __version__
 logger = structlog.get_logger(__name__)
 
 app = FastAPI(
-    title="Task Analyzer API",
+    title="TraceAI API",
     description="AI-Powered Developer Investigation Platform",
     version=__version__,
 )
@@ -50,6 +51,8 @@ class TaskListRequest(BaseModel):
     assigned_to: str | None = None
     query: str | None = None
     max_results: int = 50
+    statuses: list[str] | None = None       # Filter by task statuses
+    workspace_path: str | None = None       # Current workspace path
 
 
 class StatusResponse(BaseModel):
@@ -62,6 +65,12 @@ class StatusResponse(BaseModel):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health_check() -> dict[str, str]:
+    """Health check endpoint for server liveness detection."""
+    return {"status": "ok"}
+
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_status() -> StatusResponse:
@@ -102,6 +111,11 @@ async def list_tasks(request: TaskListRequest) -> list[dict[str, Any]]:
             query=request.query,
             max_results=request.max_results,
         )
+
+        # Filter by statuses if provided
+        if request.statuses:
+            tasks = [t for t in tasks if t.status.value in request.statuses]
+
         return [t.model_dump() for t in tasks]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
