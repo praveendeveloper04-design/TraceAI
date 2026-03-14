@@ -1,66 +1,95 @@
 /**
- * Task Analyzer — VS Code Extension Entry Point
+ * TraceAI — VS Code Extension Entry Point
  *
- * This extension provides a sidebar UI for:
- *   1. Fetching assigned tasks from the configured ticket source
- *   2. Selecting a task for AI investigation
- *   3. Viewing structured investigation reports
- *   4. Browsing investigation history
+ * Single entry point with full auto-detect flow:
+ *   1. Auto-bootstrap Python environment (~/.traceai/runtime/venv)
+ *   2. Auto-install backend from bundled extension package
+ *   3. Auto-start Python backend (with crash recovery)
+ *   4. Check configuration status
+ *   5. Load cached tasks instantly (fast startup)
+ *   6. Fetch fresh tasks async
+ *   7. Background refresh every 5 minutes
  *
- * Communication with the Python backend happens via the API service
- * over HTTP to localhost:7420.
+ * Teammates install the .vsix and everything works automatically.
+ * No repo clone or manual setup required.
  */
 
 import * as vscode from 'vscode';
-import * as cp from 'child_process';
 import { ApiService, TaskItem, InvestigationSummary } from './services/apiService';
+import { ServerManager } from './services/serverManager';
+import { StateManager } from './services/stateManager';
+import { TaskCache } from './services/taskCache';
 import { TaskTreeProvider } from './providers/taskTreeProvider';
 import { InvestigationTreeProvider } from './providers/investigationTreeProvider';
 import { ReportWebview } from './views/reportWebview';
 
 let apiService: ApiService;
+let serverManager: ServerManager;
+let stateManager: StateManager;
+let taskCache: TaskCache;
 let taskTreeProvider: TaskTreeProvider;
 let investigationTreeProvider: InvestigationTreeProvider;
 let reportWebview: ReportWebview;
-let serverProcess: cp.ChildProcess | undefined;
+let statusBarItem: vscode.StatusBarItem;
+let refreshInterval: ReturnType<typeof setInterval> | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
-    const config = vscode.workspace.getConfiguration('taskAnalyzer');
+    const config = vscode.workspace.getConfiguration('traceai');
     const port = config.get<number>('serverPort', 7420);
 
-    // Initialize services
+    // Initialize services — pass extensionPath so ServerManager can find bundled backend
     apiService = new ApiService(port);
+    serverManager = new ServerManager(port, context.extensionPath);
+    stateManager = new StateManager(context.globalState);
+    taskCache = new TaskCache();
     taskTreeProvider = new TaskTreeProvider(apiService);
     investigationTreeProvider = new InvestigationTreeProvider(apiService);
     reportWebview = new ReportWebview(context.extensionUri);
 
+    // Create status bar item
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    statusBarItem.command = 'traceai.showStatus';
+    statusBarItem.show();
+    context.subscriptions.push(statusBarItem);
+
     // Register tree views
     context.subscriptions.push(
-        vscode.window.registerTreeDataProvider('taskAnalyzer.tasks', taskTreeProvider),
-        vscode.window.registerTreeDataProvider('taskAnalyzer.investigations', investigationTreeProvider),
+        vscode.window.registerTreeDataProvider('traceai.tasks', taskTreeProvider),
+        vscode.window.registerTreeDataProvider('traceai.investigations', investigationTreeProvider),
     );
 
     // ── Register Commands ────────────────────────────────────────────────
 
-    // Setup wizard
+    // Setup wizard — uses the venv Python to run task-analyzer setup
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.setup', async () => {
-            const terminal = vscode.window.createTerminal('Task Analyzer Setup');
+        vscode.commands.registerCommand('traceai.setup', async () => {
+            const terminal = vscode.window.createTerminal('TraceAI Setup');
             terminal.show();
-            terminal.sendText('task-analyzer setup');
+            const venvPython = serverManager.getVenvPython();
+            // Use & (call operator) for PowerShell compatibility.
+            // PowerShell cannot invoke a quoted path directly — "path" -m fails.
+            // & "path" -m works in PowerShell AND cmd/bash ignore the & harmlessly.
+            terminal.sendText(`& "${venvPython}" -m task_analyzer.cli.main setup`);
         }),
     );
 
-    // Fetch tasks
+    // Fetch tasks (refresh)
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.fetchTasks', async () => {
-            await fetchTasks();
+        vscode.commands.registerCommand('traceai.refresh', async () => {
+            await refreshTasks();
+        }),
+    );
+
+    // Backward-compatible alias
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.refreshTasks', async () => {
+            await refreshTasks();
         }),
     );
 
     // Investigate (from command palette)
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.investigate', async () => {
+        vscode.commands.registerCommand('traceai.investigate', async () => {
             const taskId = await vscode.window.showInputBox({
                 prompt: 'Enter the task ID to investigate',
                 placeHolder: 'e.g., 12345 or PROJ-123',
@@ -73,14 +102,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Investigate from tree view
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.investigateFromTree', async (task: TaskItem) => {
+        vscode.commands.registerCommand('traceai.investigateFromTree', async (task: TaskItem) => {
             await investigateTask(task.external_id);
         }),
     );
 
     // View report (from command palette)
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.viewReport', async () => {
+        vscode.commands.registerCommand('traceai.viewReport', async () => {
             try {
                 const investigations = await apiService.listInvestigations();
                 if (investigations.length === 0) {
@@ -90,7 +119,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
                 const items = investigations.map(inv => ({
                     label: inv.task_title || 'Unknown',
-                    description: `${inv.status} · ${inv.started_at?.substring(0, 10) || ''}`,
+                    description: `${inv.status} \u00b7 ${inv.started_at?.substring(0, 10) || ''}`,
                     detail: `ID: ${inv.id}`,
                     id: inv.id,
                 }));
@@ -110,25 +139,25 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // View report from tree
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.viewReportFromTree', async (inv: InvestigationSummary) => {
+        vscode.commands.registerCommand('traceai.viewReportFromTree', async (inv: InvestigationSummary) => {
             await viewReport(inv.id);
         }),
     );
 
     // History
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.history', async () => {
+        vscode.commands.registerCommand('traceai.history', async () => {
             await investigationTreeProvider.loadInvestigations();
         }),
     );
 
-    // Status
+    // Show Status
     context.subscriptions.push(
-        vscode.commands.registerCommand('taskAnalyzer.status', async () => {
+        vscode.commands.registerCommand('traceai.showStatus', async () => {
             try {
                 const status = await apiService.getStatus();
                 const message = [
-                    `Task Analyzer v${status.version}`,
+                    `TraceAI v${status.version}`,
                     `Configured: ${status.configured ? 'Yes' : 'No'}`,
                     `Ticket Source: ${status.ticket_source || 'None'}`,
                     `Repositories: ${status.repositories}`,
@@ -139,41 +168,123 @@ export function activate(context: vscode.ExtensionContext): void {
                 vscode.window.showInformationMessage(message, { modal: true });
             } catch {
                 vscode.window.showWarningMessage(
-                    'Task Analyzer server is not running. Start it with: task-analyzer serve',
-                );
+                    'TraceAI server is not running.',
+                    'Start Server',
+                ).then(action => {
+                    if (action === 'Start Server') {
+                        mainFlow();
+                    }
+                });
             }
         }),
     );
 
-    // ── Auto-start server ────────────────────────────────────────────────
+    // Backward-compatible alias
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.status', async () => {
+            vscode.commands.executeCommand('traceai.showStatus');
+        }),
+    );
 
-    if (config.get<boolean>('autoStartServer', true)) {
-        startServer(port);
+    // ── Run main flow ────────────────────────────────────────────────────
+
+    mainFlow();
+
+    // ── Background refresh ───────────────────────────────────────────────
+
+    refreshInterval = setInterval(() => {
+        refreshTasks().catch(() => {
+            // Silently fail on background refresh
+        });
+    }, 5 * 60 * 1000); // 5 minutes
+
+    context.subscriptions.push({
+        dispose: () => {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        },
+    });
+}
+
+// ── Main Flow ────────────────────────────────────────────────────────────────
+
+async function mainFlow(): Promise<void> {
+    // A. Status bar: Starting
+    statusBarItem.text = '$(loading~spin) TraceAI: Starting...';
+
+    // B. Bootstrap and start server (Python detection, venv, install, start)
+    const serverRunning = await serverManager.ensureRunning();
+    if (!serverRunning) {
+        statusBarItem.text = '$(error) TraceAI: Server offline';
+        // ensureRunning() already showed specific error messages
+        return;
     }
 
-    // Initial load
-    checkServerAndLoad();
+    // C. Check if configured
+    try {
+        const status = await apiService.getStatus();
+        if (!status.configured) {
+            statusBarItem.text = '$(gear) TraceAI: Not configured';
+            const action = await vscode.window.showInformationMessage(
+                'Welcome to TraceAI. Run setup to configure your ticket source.',
+                'Run Setup',
+                'Later',
+            );
+            if (action === 'Run Setup') {
+                vscode.commands.executeCommand('traceai.setup');
+            }
+            return;
+        }
+    } catch {
+        statusBarItem.text = '$(error) TraceAI: Connection failed';
+        return;
+    }
+
+    // D. Load cached tasks instantly (fast startup)
+    statusBarItem.text = '$(loading~spin) TraceAI: Loading tasks...';
+    const cachedTasks = await taskCache.loadCached();
+    if (cachedTasks.length > 0) {
+        taskTreeProvider.setTasks(cachedTasks);
+        statusBarItem.text = `$(check) TraceAI: ${cachedTasks.length} tasks (cached)`;
+    }
+
+    // E. Fetch fresh tasks async
+    await refreshTasks();
+
+    // F. Load investigation history
+    try {
+        await investigationTreeProvider.loadInvestigations();
+    } catch {
+        // Silently fail
+    }
+
+    // G. Populate sidebar complete
+    stateManager.markFirstRunComplete();
 }
 
 // ── Helper Functions ─────────────────────────────────────────────────────────
 
-async function fetchTasks(): Promise<void> {
-    const config = vscode.workspace.getConfiguration('taskAnalyzer');
-    const assignee = config.get<string>('defaultAssignee', '');
+async function refreshTasks(): Promise<void> {
+    const config = vscode.workspace.getConfiguration('traceai');
+    const assignee = stateManager.getAssignee() || config.get<string>('defaultAssignee', '');
 
     try {
-        await vscode.window.withProgress(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: 'Fetching tasks...',
-                cancellable: false,
-            },
-            async () => {
-                await taskTreeProvider.loadTasks(assignee || undefined);
-            },
+        const tasks = await apiService.fetchTasks(
+            assignee || undefined,
+            undefined,
+            50,
+            ['new', 'active', 'in_progress', 'unknown'],
         );
+        taskTreeProvider.setTasks(tasks);
+        await taskCache.save(tasks);
+        statusBarItem.text = `$(check) TraceAI: ${tasks.length} tasks`;
     } catch (error) {
-        vscode.window.showErrorMessage(`Failed to fetch tasks: ${error}`);
+        // Don't overwrite status bar if we have cached data
+        const cached = await taskCache.loadCached();
+        if (cached.length === 0) {
+            statusBarItem.text = '$(warning) TraceAI: Fetch failed';
+        }
     }
 }
 
@@ -230,41 +341,9 @@ async function viewReport(reportId: string): Promise<void> {
     }
 }
 
-function startServer(port: number): void {
-    try {
-        serverProcess = cp.spawn('task-analyzer', ['serve', '--port', port.toString()], {
-            stdio: 'ignore',
-            detached: true,
-            shell: true,
-        });
-        serverProcess.unref();
-    } catch {
-        // Server might already be running or not installed
-    }
-}
-
-async function checkServerAndLoad(): Promise<void> {
-    // Wait a moment for server to start
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    const running = await apiService.isServerRunning();
-    if (running) {
-        // Auto-load tasks and investigations
-        try {
-            await taskTreeProvider.loadTasks();
-        } catch {
-            // Silently fail on initial load
-        }
-        try {
-            await investigationTreeProvider.loadInvestigations();
-        } catch {
-            // Silently fail
-        }
-    }
-}
-
 export function deactivate(): void {
-    if (serverProcess) {
-        serverProcess.kill();
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
     }
+    serverManager?.dispose();
 }

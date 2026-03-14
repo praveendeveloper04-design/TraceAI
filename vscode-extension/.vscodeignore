@@ -1,0 +1,52 @@
+# ─── VS Code Extension Packaging ─────────────────────────────────────────────
+# This file controls what is EXCLUDED from the .vsix package.
+# Everything not listed here is included.
+
+# Source TypeScript (compiled JS is in out/)
+src/**
+
+# Development config
+.vscode/**
+.vscode-test/**
+tsconfig.json
+.eslintrc*
+
+# Git
+.git/**
+.github/**
+.gitignore
+
+# Tests
+tests/**
+test/**
+
+# Documentation (keep README.md for marketplace)
+docs/**
+
+
+
+# Python bytecode
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+*.egg-info/**
+
+# Build artifacts
+dist/**
+build/**
+*.vsix
+
+# Environment files
+.env
+.env.*
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Old batch files
+setup.bat
+run.bat
+investigate.bat
+setup-vscode.bat

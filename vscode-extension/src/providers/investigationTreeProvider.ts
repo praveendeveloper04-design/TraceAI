@@ -1,5 +1,5 @@
 /**
- * Investigation Tree Provider — Displays investigation history in the sidebar.
+ * TraceAI Investigation Tree Provider — Displays investigation history in the sidebar.
  */
 
 import * as vscode from 'vscode';
@@ -12,7 +12,7 @@ export class InvestigationTreeItem extends vscode.TreeItem {
         super(investigation.task_title || 'Unknown Task', vscode.TreeItemCollapsibleState.None);
 
         this.id = investigation.id;
-        this.description = `${investigation.status} · ${investigation.started_at?.substring(0, 10) || ''}`;
+        this.description = `${investigation.status} \u00b7 ${investigation.started_at?.substring(0, 10) || ''}`;
 
         const statusIcon: Record<string, string> = {
             completed: 'check',
@@ -25,7 +25,7 @@ export class InvestigationTreeItem extends vscode.TreeItem {
         this.contextValue = 'investigation';
 
         this.command = {
-            command: 'taskAnalyzer.viewReportFromTree',
+            command: 'traceai.viewReportFromTree',
             title: 'View Report',
             arguments: [investigation],
         };

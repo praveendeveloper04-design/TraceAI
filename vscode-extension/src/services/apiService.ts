@@ -1,8 +1,8 @@
 /**
- * Task Analyzer API Service
+ * TraceAI API Service
  *
  * Handles all communication between the VS Code extension and the
- * Task Analyzer Python backend API server.
+ * TraceAI Python backend API server.
  */
 
 import axios, { AxiosInstance } from 'axios';
@@ -44,6 +44,13 @@ export interface InvestigationReport {
     affected_files: string[];
     affected_services: string[];
     error: string | null;
+    investigation_graph: Record<string, unknown> | null;
+    root_cause_hypotheses: Array<{
+        description: string;
+        evidence: string[];
+        confidence: number;
+    }> | null;
+    evidence_summary: Record<string, unknown> | null;
 }
 
 export interface InvestigationFinding {
@@ -79,11 +86,28 @@ export class ApiService {
         return resp.data;
     }
 
-    async fetchTasks(assignedTo?: string, query?: string, maxResults: number = 50): Promise<TaskItem[]> {
+    async healthCheck(): Promise<boolean> {
+        try {
+            const resp = await this.client.get('/api/health', { timeout: 3000 });
+            return resp.data?.status === 'ok';
+        } catch {
+            return false;
+        }
+    }
+
+    async fetchTasks(
+        assignedTo?: string,
+        query?: string,
+        maxResults: number = 50,
+        statuses?: string[],
+        workspacePath?: string,
+    ): Promise<TaskItem[]> {
         const resp = await this.client.post('/api/tasks', {
             assigned_to: assignedTo || null,
             query: query || null,
             max_results: maxResults,
+            statuses: statuses || null,
+            workspace_path: workspacePath || null,
         });
         return resp.data;
     }
