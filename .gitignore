@@ -56,6 +56,9 @@ vscode-extension/*.vsix
 *.log
 logs/
 
-# ─── Task Analyzer User Data (never commit) ───────────────────────────────
+# ─── Investigation Output Files ──────────────────────────────────────────
+investigation_*.md
+
+# ─── TraceAI User Data (never commit) ────────────────────────────────────
 # ~/.task-analyzer/ is the default data directory
 # It contains user-specific config, profiles, and investigation reports
