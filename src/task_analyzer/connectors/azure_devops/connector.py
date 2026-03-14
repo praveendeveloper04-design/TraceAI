@@ -43,13 +43,26 @@ class AzureDevOpsConnector(BaseConnector):
             "base_url",
             f"https://dev.azure.com/{self._org}/{self._project}",
         )
+        self._org_url = f"https://dev.azure.com/{self._org}"
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             pat = self._get_credential("pat")
             if not pat:
-                raise ValueError("Azure DevOps PAT not found in keychain")
+                raise ValueError(
+                    "Azure DevOps PAT not found. Checked: OS keychain, "
+                    "~/.traceai/credentials.json, config.json settings. "
+                    "Please run 'traceai setup' or create credentials.json."
+                )
+            logger.info(
+                "azure_devops_auth",
+                org=self._org,
+                project=self._project,
+                base_url=self._base_url,
+                pat_length=len(pat),
+                pat_prefix=pat[:4] + "..." if len(pat) > 4 else "****",
+            )
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 auth=("", pat),
@@ -59,9 +72,38 @@ class AzureDevOpsConnector(BaseConnector):
         return self._client
 
     async def validate_connection(self) -> bool:
-        client = await self._get_client()
-        resp = await client.get("/_apis/projects?api-version=7.1")
+        """
+        Validate the connection by calling the org-level projects endpoint.
+
+        Note: /_apis/projects is an organization-scoped endpoint. It must be
+        called against the org URL (dev.azure.com/{org}), NOT the project URL
+        (dev.azure.com/{org}/{project}). Calling it with the project in the
+        path returns 401 on Azure DevOps Services.
+
+        We use a separate one-shot request here because the main client's
+        base_url is project-scoped (which is correct for WIQL and work item
+        APIs), but the projects endpoint lives at the org level.
+        """
+        pat = self._get_credential("pat")
+        if not pat:
+            raise ValueError(
+                "Azure DevOps PAT not found. Checked: OS keychain, "
+                "~/.traceai/credentials.json, config.json settings."
+            )
+        url = f"{self._org_url}/_apis/projects?api-version=7.1"
+        logger.info("azure_devops_validating", url=url)
+        async with httpx.AsyncClient(auth=("", pat), timeout=30.0) as client:
+            resp = await client.get(url)
+        if resp.status_code != 200:
+            logger.error(
+                "azure_devops_auth_failed",
+                status=resp.status_code,
+                body=resp.text[:500],
+                url=url,
+            )
         resp.raise_for_status()
+        # Now initialize the project-scoped client for all subsequent calls
+        await self._get_client()
         logger.info("azure_devops_connected", org=self._org, project=self._project)
         self._connected = True
         return True

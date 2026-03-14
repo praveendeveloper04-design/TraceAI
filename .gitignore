@@ -61,5 +61,6 @@ logs/
 investigation_*.md
 
 # ─── TraceAI User Data (never commit) ────────────────────────────────────
-# ~/.task-analyzer/ is the default data directory
+# ~/.traceai/ is the default data directory
 # It contains user-specific config, profiles, and investigation reports
+.traceai/

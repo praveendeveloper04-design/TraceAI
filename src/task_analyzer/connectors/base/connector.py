@@ -17,11 +17,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 from task_analyzer.models.schemas import ConnectorConfig, ConnectorType, Task
 from task_analyzer.security.credential_manager import CredentialManager
 
 if TYPE_CHECKING:
     from task_analyzer.core.rate_limiter import RateLimiter
+
+logger = structlog.get_logger(__name__)
 
 
 class BaseConnector(ABC):
@@ -112,8 +116,46 @@ class BaseConnector(ABC):
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _get_credential(self, key: str) -> str | None:
-        """Retrieve a credential from the OS keychain."""
-        return self._creds.retrieve(self.config.name, key)
+        """
+        Retrieve a credential with three-tier resolution:
+
+          1. OS keychain (via CredentialManager)
+          2. ~/.traceai/credentials.json (via CredentialManager file fallback)
+          3. config.settings (last resort — for configs where the wizard
+             stored the secret in settings instead of the keychain)
+
+        Logs the resolution source for diagnostics.
+        """
+        # Tier 1 + 2: keychain and credentials.json
+        value = self._creds.retrieve(self.config.name, key)
+        if value:
+            logger.debug(
+                "credential_resolved",
+                connector=self.config.name,
+                key=key,
+                source="keyring_or_file",
+            )
+            return value
+
+        # Tier 3: config.settings fallback
+        value = self.config.settings.get(key)
+        if value:
+            logger.info(
+                "credential_resolved",
+                connector=self.config.name,
+                key=key,
+                source="config_settings",
+                hint="Consider moving this secret to the OS keychain or credentials.json",
+            )
+            return str(value)
+
+        logger.error(
+            "credential_missing",
+            connector=self.config.name,
+            key=key,
+            checked=["keyring", "credentials.json", "config.settings"],
+        )
+        return None
 
     def _get_setting(self, key: str, default: Any = None) -> Any:
         """Read a non-secret setting from the connector config."""

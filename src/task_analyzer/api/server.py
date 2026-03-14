@@ -13,6 +13,7 @@ The VS Code extension communicates with this server over HTTP/WebSocket.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─── Startup Diagnostics ─────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def _startup_diagnostics():
+    """Log key configuration state at server startup."""
+    from task_analyzer.investigation.engine import _sync_anthropic_env_vars
+
+    logger.info("server_starting", version=__version__, port=7420)
+
+    # Sync all Anthropic env vars from Windows registry at startup
+    _sync_anthropic_env_vars()
+
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+
+    if key:
+        logger.info(
+            "startup_llm_key_loaded",
+            key_length=len(key),
+            key_prefix=key[:8] + "..." if len(key) > 8 else "****",
+            base_url=base_url or "https://api.anthropic.com (default)",
+        )
+    else:
+        logger.error(
+            "startup_llm_key_missing",
+            message="Investigations will fail. Set ANTHROPIC_API_KEY or add to credentials.json.",
+        )
 
 
 # ── Request/Response Models ───────────────────────────────────────────────────
@@ -101,6 +131,16 @@ async def list_tasks(request: TaskListRequest) -> list[dict[str, Any]]:
     if not config or not config.ticket_source:
         raise HTTPException(status_code=400, detail="No ticket source configured")
 
+    logger.info(
+        "list_tasks_request",
+        ticket_source=config.ticket_source.connector_type.value,
+        connector_name=config.ticket_source.name,
+        assigned_to=request.assigned_to,
+        statuses=request.statuses,
+        settings_keys=list(config.ticket_source.settings.keys()),
+        credential_keys=config.ticket_source.credential_keys,
+    )
+
     registry = create_default_registry()
     connector = registry.create(config.ticket_source)
 
@@ -116,8 +156,10 @@ async def list_tasks(request: TaskListRequest) -> list[dict[str, Any]]:
         if request.statuses:
             tasks = [t for t in tasks if t.status.value in request.statuses]
 
+        logger.info("list_tasks_success", count=len(tasks))
         return [t.model_dump() for t in tasks]
     except Exception as exc:
+        logger.error("list_tasks_failed", error=str(exc), error_type=type(exc).__name__)
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         await connector.disconnect()
@@ -166,13 +208,19 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
     registry = create_default_registry()
     ticket_connector = registry.create(config.ticket_source)
 
-    # Initialize optional connectors
+    # Initialize optional connectors — failures are logged, not fatal
     for conn_config in config.connectors:
         if conn_config.enabled:
             try:
                 registry.create(conn_config)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "optional_connector_init_failed",
+                    connector=conn_config.name,
+                    connector_type=conn_config.connector_type.value,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
     try:
         await ticket_connector.validate_connection()
@@ -187,16 +235,30 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
             if profile:
                 profiles.append(profile)
 
-        # Run investigation
+        # Run investigation — the engine handles all internal failures gracefully
         engine = InvestigationEngine(config=config, registry=registry, profiles=profiles)
         report = await engine.investigate(task)
         store.save_investigation(report)
+
+        logger.info(
+            "investigation_api_complete",
+            task_id=request.task_id,
+            status=report.status.value,
+            findings=len(report.findings),
+            has_warnings=bool(report.error),
+        )
 
         return report.model_dump()
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.error(
+            "investigation_api_failed",
+            task_id=request.task_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
     finally:
         await registry.disconnect_all()
 
