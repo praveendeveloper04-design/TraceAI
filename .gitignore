@@ -1,0 +1,61 @@
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.tox/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.pyo
+*.pyd
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─── Environment & Secrets ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+*.secret
+
+# ─── IDE / Editor ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ─── OS Files ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# ─── Node / VS Code Extension ─────────────────────────────────────────────
+node_modules/
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Task Analyzer User Data (never commit) ───────────────────────────────
+# ~/.task-analyzer/ is the default data directory
+# It contains user-specific config, profiles, and investigation reports

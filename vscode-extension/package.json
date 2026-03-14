@@ -1,0 +1,118 @@
+{
+    "name": "task-analyzer",
+    "displayName": "Task Analyzer",
+    "description": "AI-powered developer investigation platform — investigate bugs, incidents, and user stories with Claude",
+    "version": "0.1.0",
+    "publisher": "task-analyzer",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other",
+        "Machine Learning"
+    ],
+    "keywords": [
+        "ai",
+        "investigation",
+        "bugs",
+        "claude",
+        "langchain",
+        "developer-tools"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "taskAnalyzer.setup",
+                "title": "Task Analyzer: Run Setup Wizard",
+                "icon": "$(gear)"
+            },
+            {
+                "command": "taskAnalyzer.fetchTasks",
+                "title": "Task Analyzer: Fetch My Tasks",
+                "icon": "$(list-unordered)"
+            },
+            {
+                "command": "taskAnalyzer.investigate",
+                "title": "Task Analyzer: Investigate Task",
+                "icon": "$(search)"
+            },
+            {
+                "command": "taskAnalyzer.viewReport",
+                "title": "Task Analyzer: View Investigation Report",
+                "icon": "$(file-text)"
+            },
+            {
+                "command": "taskAnalyzer.history",
+                "title": "Task Analyzer: Investigation History",
+                "icon": "$(history)"
+            },
+            {
+                "command": "taskAnalyzer.status",
+                "title": "Task Analyzer: Show Status",
+                "icon": "$(info)"
+            }
+        ],
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "taskAnalyzer",
+                    "title": "Task Analyzer",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "taskAnalyzer": [
+                {
+                    "id": "taskAnalyzer.tasks",
+                    "name": "Tasks"
+                },
+                {
+                    "id": "taskAnalyzer.investigations",
+                    "name": "Investigations"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Task Analyzer",
+            "properties": {
+                "taskAnalyzer.serverPort": {
+                    "type": "number",
+                    "default": 7420,
+                    "description": "Port for the Task Analyzer API server"
+                },
+                "taskAnalyzer.autoStartServer": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically start the API server when VS Code opens"
+                },
+                "taskAnalyzer.defaultAssignee": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Default assignee filter for task fetching"
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "lint": "eslint src --ext ts"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "@typescript-eslint/eslint-plugin": "^7.0.0",
+        "@typescript-eslint/parser": "^7.0.0",
+        "eslint": "^8.56.0",
+        "typescript": "^5.3.0"
+    },
+    "dependencies": {
+        "axios": "^1.7.0"
+    }
+}
