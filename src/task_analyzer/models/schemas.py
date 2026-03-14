@@ -225,6 +225,9 @@ class InvestigationReport(BaseModel):
     tokens_used: int = 0
     model_used: str = ""
     error: str | None = None
+    investigation_graph: dict | None = None          # Investigation relationship graph
+    root_cause_hypotheses: list[dict] | None = None  # Ranked root cause hypotheses
+    evidence_summary: dict | None = None             # Aggregated evidence from skills
 
     def to_markdown(self) -> str:
         """Render the report as a Markdown document."""
@@ -278,6 +281,26 @@ class InvestigationReport(BaseModel):
                 md.append(f"\n{s.reasoning}")
             md.append("")
 
+        if self.root_cause_hypotheses:
+            md.append("## Root Cause Hypotheses")
+            for i, h in enumerate(self.root_cause_hypotheses, 1):
+                confidence = h.get("confidence", 0)
+                md.append(f"\n### {i}. {h.get('description', 'Unknown')}")
+                md.append(f"**Confidence**: {confidence:.0%}")
+                evidence = h.get("evidence", [])
+                if evidence:
+                    md.append("\n**Evidence**:")
+                    for e in evidence:
+                        md.append(f"- {e}")
+            md.append("")
+
+        if self.investigation_graph:
+            stats = self.investigation_graph.get("stats", {})
+            md.append("## Investigation Graph")
+            md.append(f"- **Nodes**: {stats.get('node_count', 0)}")
+            md.append(f"- **Edges**: {stats.get('edge_count', 0)}")
+            md.append("")
+
         return "\n".join(md)
 
 
@@ -295,7 +318,10 @@ class ConnectorConfig(BaseModel):
 
 class PlatformConfig(BaseModel):
     """Top-level platform configuration — persisted to disk (no secrets)."""
+    config_version: str = "1.0"                       # Config schema version for migrations
     version: str = "1.0"
+    mode: str = "safe"                                # "safe" (default) or "developer"
+    background_refresh: bool = True                   # Enable 5-min auto-refresh
     repositories: list[str] = Field(default_factory=list)
     ticket_source: ConnectorConfig | None = None
     connectors: list[ConnectorConfig] = Field(default_factory=list)
@@ -305,3 +331,24 @@ class PlatformConfig(BaseModel):
     investigation_max_steps: int = 15
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ─── Config Migration ────────────────────────────────────────────────────────
+
+CURRENT_CONFIG_VERSION = "1.0"
+
+
+def migrate_config(data: dict, from_version: str) -> dict:
+    """
+    Migrate config data from an older version to the current version.
+
+    Add migration steps here as the config schema evolves.
+    """
+    # v0.0 -> v1.0: Add new fields with defaults
+    if from_version < "1.0":
+        data.setdefault("config_version", "1.0")
+        data.setdefault("mode", "safe")
+        data.setdefault("background_refresh", True)
+
+    data["config_version"] = CURRENT_CONFIG_VERSION
+    return data

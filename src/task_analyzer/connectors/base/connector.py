@@ -15,15 +15,18 @@ touching the investigation engine.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from task_analyzer.models.schemas import ConnectorConfig, ConnectorType, Task
 from task_analyzer.security.credential_manager import CredentialManager
 
+if TYPE_CHECKING:
+    from task_analyzer.core.rate_limiter import RateLimiter
+
 
 class BaseConnector(ABC):
     """
-    Abstract base class for all Task Analyzer connectors.
+    Abstract base class for all TraceAI connectors.
 
     Lifecycle:
         1. ``__init__`` — receives config + credential manager
@@ -46,6 +49,18 @@ class BaseConnector(ABC):
         self.config = config
         self._creds = credential_manager
         self._connected = False
+        self._rate_limiter: RateLimiter | None = None
+
+    # ── Rate Limiter Integration ───────────────────────────────────────────
+
+    def set_rate_limiter(self, limiter: RateLimiter) -> None:
+        """Attach a rate limiter to this connector."""
+        self._rate_limiter = limiter
+
+    def _check_rate_limit(self) -> None:
+        """Check rate limit before making an API call."""
+        if self._rate_limiter:
+            self._rate_limiter.acquire(self.connector_type.value)
 
     # ── Abstract Methods (must be implemented) ────────────────────────────
 

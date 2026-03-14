@@ -18,14 +18,14 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-SERVICE_NAMESPACE = "task-analyzer"
+SERVICE_NAMESPACE = "traceai"
 
 
 class CredentialManager:
     """
     Thin wrapper around the OS keychain for storing and retrieving secrets.
 
-    Every credential is namespaced under ``task-analyzer/<connector>/<key>``
+    Every credential is namespaced under ``traceai/<connector>/<key>``
     so multiple connector instances can coexist without collision.
     """
 

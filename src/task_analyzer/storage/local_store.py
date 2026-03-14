@@ -2,7 +2,7 @@
 Storage — Local persistence for configuration, profiles, and investigation reports.
 
 Uses SQLite for structured data and JSON files for configuration.
-All data is stored under ``~/.task-analyzer/``.
+All data is stored under ``~/.traceai/``.
 """
 
 from __future__ import annotations
@@ -15,29 +15,34 @@ from typing import Any
 import structlog
 
 from task_analyzer.models.schemas import (
+    CURRENT_CONFIG_VERSION,
     InvestigationReport,
     PlatformConfig,
     ProjectProfile,
+    migrate_config,
 )
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_DATA_DIR = Path.home() / ".task-analyzer"
+DEFAULT_DATA_DIR = Path.home() / ".traceai"
 
 
 class LocalStore:
     """
-    File-based local storage for Task Analyzer data.
+    File-based local storage for TraceAI data.
 
     Layout::
 
-        ~/.task-analyzer/
+        ~/.traceai/
         ├── config.json              # Platform configuration (no secrets)
         ├── profiles/                # Project knowledge profiles
         │   └── <repo-name>.json
         ├── investigations/          # Investigation reports
         │   └── <id>.json
-        └── cache/                   # Ephemeral cache
+        ├── cache/                   # Ephemeral cache
+        │   └── tasks.json           # Local task cache
+        └── logs/                    # Audit logs
+            └── investigation.log
     """
 
     def __init__(self, data_dir: Path | None = None) -> None:
@@ -46,10 +51,17 @@ class LocalStore:
         self.profiles_dir = self.data_dir / "profiles"
         self.investigations_dir = self.data_dir / "investigations"
         self.cache_dir = self.data_dir / "cache"
+        self.logs_dir = self.data_dir / "logs"
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:
-        for d in [self.data_dir, self.profiles_dir, self.investigations_dir, self.cache_dir]:
+        for d in [
+            self.data_dir,
+            self.profiles_dir,
+            self.investigations_dir,
+            self.cache_dir,
+            self.logs_dir,
+        ]:
             d.mkdir(parents=True, exist_ok=True)
 
     # ── Platform Config ───────────────────────────────────────────────────
@@ -66,6 +78,15 @@ class LocalStore:
             return None
         try:
             data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            # Config versioning: migrate if needed
+            version = data.get("config_version", "0.0")
+            if version != CURRENT_CONFIG_VERSION:
+                data = migrate_config(data, version)
+                # Save migrated config back to disk
+                self.config_path.write_text(
+                    json.dumps(data, indent=2, default=str), encoding="utf-8"
+                )
+                logger.info("config_migrated", from_version=version, to_version=CURRENT_CONFIG_VERSION)
             return PlatformConfig.model_validate(data)
         except Exception as exc:
             logger.error("config_load_failed", error=str(exc))
