@@ -122,6 +122,72 @@ export class ApiService {
         return resp.data;
     }
 
+    /**
+     * Subscribe to live investigation progress via SSE.
+     * Calls onProgress for each stage, then onComplete with the final report.
+     */
+    async investigateWithProgress(
+        taskId: string,
+        onProgress: (stage: string, message: string) => void,
+        onComplete: (report: InvestigationReport) => void,
+        onError: (error: string) => void,
+    ): Promise<void> {
+        const url = `http://127.0.0.1:${this.client.defaults.baseURL?.split(':').pop()?.replace('/', '') || '7420'}/api/investigate/${taskId}/stream`;
+        const baseUrl = this.client.defaults.baseURL || 'http://127.0.0.1:7420';
+
+        try {
+            const resp = await this.client.get(`/api/investigate/${taskId}/stream`, {
+                responseType: 'text',
+                timeout: 300000, // 5 minutes for long investigations
+                // Axios doesn't natively support SSE, so we parse the full response
+            });
+
+            const text = resp.data as string;
+            const lines = text.split('\n');
+
+            let currentEvent = '';
+            let currentData = '';
+
+            for (const line of lines) {
+                if (line.startsWith('event: ')) {
+                    currentEvent = line.substring(7).trim();
+                } else if (line.startsWith('data: ')) {
+                    currentData = line.substring(6).trim();
+
+                    if (currentEvent === 'progress') {
+                        try {
+                            const parsed = JSON.parse(currentData);
+                            onProgress(parsed.stage || '', parsed.message || '');
+                        } catch { /* skip malformed */ }
+                    } else if (currentEvent === 'complete') {
+                        try {
+                            const report = JSON.parse(currentData) as InvestigationReport;
+                            onComplete(report);
+                        } catch { /* skip malformed */ }
+                    } else if (currentEvent === 'error') {
+                        try {
+                            const err = JSON.parse(currentData);
+                            onError(err.error || 'Unknown error');
+                        } catch {
+                            onError(currentData);
+                        }
+                    }
+
+                    currentEvent = '';
+                    currentData = '';
+                }
+            }
+        } catch (error) {
+            // Fallback: use the non-streaming endpoint
+            try {
+                const report = await this.investigate(taskId);
+                onComplete(report);
+            } catch (fallbackError) {
+                onError(`Investigation failed: ${fallbackError}`);
+            }
+        }
+    }
+
     async listInvestigations(limit: number = 20): Promise<InvestigationSummary[]> {
         const resp = await this.client.get('/api/investigations', { params: { limit } });
         return resp.data;
@@ -145,4 +211,32 @@ export class ApiService {
             return false;
         }
     }
+
+    async validateSystem(): Promise<Array<{ component: string; ok: boolean; message: string; details: string }>> {
+        const resp = await this.client.get('/api/validate');
+        return resp.data;
+    }
+
+    async generatePatch(investigationId: string, workspacePath?: string): Promise<PatchResult> {
+        const resp = await this.client.post('/api/generate-patch', {
+            investigation_id: investigationId,
+            workspace_path: workspacePath || null,
+        });
+        return resp.data;
+    }
+}
+
+export interface PatchFile {
+    path: string;
+    description: string;
+    original: string;
+    patched: string;
+}
+
+export interface PatchResult {
+    investigation_id: string;
+    task_title: string;
+    files: PatchFile[];
+    raw_response?: string;
+    parse_error?: string;
 }

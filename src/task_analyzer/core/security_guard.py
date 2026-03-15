@@ -37,7 +37,9 @@ class ToolPermission:
     allowed_operations: list[str] = field(default_factory=list)
 
 
-# Pre-registered tools — every tool must be declared here
+# Pre-registered tools — every tool must be declared here.
+# The LLM must never directly modify files. All write operations
+# go through the patch workflow with user confirmation.
 TOOL_REGISTRY: dict[str, ToolPermission] = {
     "RepoReader": ToolPermission(
         name="RepoReader",
@@ -84,6 +86,16 @@ TOOL_REGISTRY: dict[str, ToolPermission] = {
     ),
 }
 
+# Restricted tool categories — these are NEVER registered in TOOL_REGISTRY.
+# Any attempt to call them raises SecurityError.
+# Write operations go through the patch workflow, not through tool calls.
+RESTRICTED_CATEGORIES = {
+    "repo.write": "Repository writes are blocked. Use the patch workflow.",
+    "filesystem.write": "Direct file writes are blocked. Use the patch workflow.",
+    "database.write": "Database writes are blocked. Read-only access only.",
+    "shell.execute": "Shell command execution is blocked.",
+}
+
 
 # ─── Security Guard ──────────────────────────────────────────────────────────
 
@@ -109,11 +121,41 @@ class SecurityGuard:
         "MERGE", "CALL", "REPLACE", "LOAD", "RENAME",
     })
 
+    # Objects that expose internal metadata or system procedures.
+    # Checked against the full uppercase query text.
+    BLOCKED_SQL_OBJECTS = (
+        "INFORMATION_SCHEMA",
+        "SYS.",
+        "SYSOBJECTS",
+        "SYSCOLUMNS",
+        "SYSINDEXES",
+        "SYSUSERS",
+        "XP_",
+        "SP_CONFIGURE",
+        "SP_EXECUTESQL",
+        "MASTER..",
+        "MSDB..",
+        "TEMPDB..",
+        "OPENROWSET",
+        "OPENQUERY",
+        "OPENDATASOURCE",
+    )
+
+    # Feature flags for validation checks (used by traceai validate)
+    sql_guard_active: bool = True
+    prompt_injection_guard_active: bool = True
+    patch_path_guard_active: bool = True
+
     def __init__(self, safe_mode: bool = True) -> None:
         self.safe_mode = safe_mode
 
     def validate_tool(self, tool_name: str, operation: str) -> bool:
         """Check tool is registered and operation is allowed."""
+        # Check restricted categories first
+        for category, reason in RESTRICTED_CATEGORIES.items():
+            if tool_name.lower().startswith(category.split(".")[0]) and "write" in operation.lower():
+                raise SecurityError(f"Restricted operation: {reason}")
+
         perm = TOOL_REGISTRY.get(tool_name)
         if not perm:
             raise SecurityError(f"Unregistered tool: {tool_name}")
@@ -169,6 +211,15 @@ class SecurityGuard:
                     f"Only read-only queries are allowed."
                 )
 
+        # Step 4b: Block access to system objects and metadata
+        upper_statement = statement.upper()
+        for obj in self.BLOCKED_SQL_OBJECTS:
+            if obj in upper_statement:
+                raise SecurityError(
+                    f"Access to system object '{obj}' is blocked. "
+                    f"Queries against system metadata are not permitted."
+                )
+
         # Step 5: Return cleaned single statement
         return statement
 
@@ -189,6 +240,44 @@ class SecurityGuard:
                 f"TraceAI only supports read-only file access (mode='r')."
             )
         return True
+
+    @staticmethod
+    def validate_patch_path(file_path: str, workspace_root: str) -> str:
+        """
+        Validate that a patch target path is inside the workspace.
+
+        Prevents path traversal attacks such as:
+          ../../.ssh/config
+          /etc/passwd
+          C:\\Windows\\System32\\...
+
+        Returns the resolved absolute path if safe.
+        Raises SecurityError if the path escapes the workspace.
+        """
+        from pathlib import Path as _Path
+
+        root = _Path(workspace_root).resolve()
+        resolved = (root / file_path).resolve()
+
+        # Check the resolved path is inside the workspace
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            raise SecurityError(
+                f"Path traversal blocked: '{file_path}' resolves to "
+                f"'{resolved}' which is outside the workspace '{root}'."
+            )
+
+        # Block writes to dotfiles/hidden directories (.git, .ssh, .env)
+        for part in resolved.relative_to(root).parts:
+            if part.startswith("."):
+                raise SecurityError(
+                    f"Patch target blocked: '{file_path}' targets hidden "
+                    f"path component '.{part[1:]}'. Patches cannot modify "
+                    f"dotfiles or hidden directories."
+                )
+
+        return str(resolved)
 
     @staticmethod
     def _strip_sql_comments(sql: str) -> str:

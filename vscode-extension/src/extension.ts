@@ -44,7 +44,7 @@ export function activate(context: vscode.ExtensionContext): void {
     taskCache = new TaskCache();
     taskTreeProvider = new TaskTreeProvider(apiService);
     investigationTreeProvider = new InvestigationTreeProvider(apiService);
-    reportWebview = new ReportWebview(context.extensionUri);
+    reportWebview = new ReportWebview(context.extensionUri, apiService);
 
     // Create status bar item
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -211,23 +211,24 @@ export function activate(context: vscode.ExtensionContext): void {
 
 async function mainFlow(): Promise<void> {
     // A. Status bar: Starting
-    statusBarItem.text = '$(loading~spin) TraceAI: Starting...';
+    statusBarItem.text = '$(loading~spin) TraceAI: Starting backend...';
 
     // B. Bootstrap and start server (Python detection, venv, install, start)
     const serverRunning = await serverManager.ensureRunning();
     if (!serverRunning) {
         statusBarItem.text = '$(error) TraceAI: Server offline';
-        // ensureRunning() already showed specific error messages
         return;
     }
 
-    // C. Check if configured
+    statusBarItem.text = '$(check) TraceAI: Connected';
+
+    // C. Check if configured — prompt setup if not
     try {
         const status = await apiService.getStatus();
         if (!status.configured) {
-            statusBarItem.text = '$(gear) TraceAI: Not configured';
+            statusBarItem.text = '$(gear) TraceAI: Setup required';
             const action = await vscode.window.showInformationMessage(
-                'Welcome to TraceAI. Run setup to configure your ticket source.',
+                'Welcome to TraceAI! Run the setup wizard to connect your ticket source and AI key.',
                 'Run Setup',
                 'Later',
             );
@@ -241,7 +242,6 @@ async function mainFlow(): Promise<void> {
         return;
     }
 
-    // D. Load cached tasks instantly (fast startup)
     statusBarItem.text = '$(loading~spin) TraceAI: Loading tasks...';
     const cachedTasks = await taskCache.loadCached();
     if (cachedTasks.length > 0) {
@@ -289,46 +289,96 @@ async function refreshTasks(): Promise<void> {
 }
 
 async function investigateTask(taskId: string): Promise<void> {
+    // Open the webview immediately with a live progress panel
+    reportWebview.showProgress(taskId);
+
+    let cancelled = false;
+
     try {
-        const report = await vscode.window.withProgress(
+        await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
-                title: `Investigating task ${taskId}...`,
-                cancellable: false,
+                title: `Investigating ticket ${taskId}`,
+                cancellable: true,
             },
-            async (progress) => {
-                progress.report({ message: 'Fetching task details...' });
-                progress.report({ increment: 20 });
+            async (progress, token) => {
+                // Cancel button handler
+                token.onCancellationRequested(() => {
+                    cancelled = true;
+                    reportWebview.updateProgress('cancelled', 'Investigation cancelled by user.');
+                    vscode.window.showInformationMessage('Investigation cancelled.');
+                });
 
-                progress.report({ message: 'Running AI investigation...' });
-                progress.report({ increment: 30 });
+                // Simulate live progress stages while the API call runs
+                const stages = [
+                    { stage: 'loading_ticket', msg: 'Loading ticket details...', ms: 600 },
+                    { stage: 'skills_execution', msg: 'Running investigation skills...', ms: 1500 },
+                    { stage: 'evidence_aggregation', msg: 'Aggregating evidence...', ms: 1000 },
+                    { stage: 'building_graph', msg: 'Building evidence graph...', ms: 800 },
+                    { stage: 'building_context', msg: 'Building investigation context...', ms: 800 },
+                    { stage: 'ai_reasoning', msg: 'Running AI reasoning with Claude...', ms: 0 },
+                ];
 
-                const result = await apiService.investigate(taskId);
+                // Advance stages in parallel with the API call
+                const advanceStages = async () => {
+                    for (const s of stages) {
+                        if (cancelled) { return; }
+                        progress.report({ message: s.msg, increment: 14 });
+                        reportWebview.updateProgress(s.stage, s.msg);
+                        if (s.ms > 0) {
+                            await new Promise(r => setTimeout(r, s.ms));
+                        } else {
+                            break; // Wait for API from here
+                        }
+                    }
+                };
 
-                progress.report({ message: 'Rendering report...' });
-                progress.report({ increment: 50 });
+                const stagePromise = advanceStages();
+                const apiPromise = apiService.investigate(taskId);
 
-                return result;
+                await stagePromise;
+                if (cancelled) { return; }
+
+                try {
+                    const report = await apiPromise;
+                    if (cancelled) { return; }
+
+                    // Final stages
+                    reportWebview.updateProgress('generating_report', 'Generating report...');
+                    progress.report({ message: 'Generating report...', increment: 14 });
+                    await new Promise(r => setTimeout(r, 400));
+
+                    reportWebview.updateProgress('complete', 'Investigation complete!');
+                    await new Promise(r => setTimeout(r, 500));
+
+                    // Replace progress with the full report
+                    reportWebview.show(report);
+
+                    if (report.status === 'completed') {
+                        vscode.window.showInformationMessage(
+                            `Investigation complete: ${report.findings.length} finding(s)`,
+                        );
+                    } else if (report.status === 'failed') {
+                        vscode.window.showErrorMessage(
+                            `Investigation failed: ${report.error || 'Unknown error'}`,
+                        );
+                    }
+                } catch (err) {
+                    if (!cancelled) {
+                        reportWebview.updateProgress('error', `Failed: ${err}`);
+                        vscode.window.showErrorMessage(`Investigation failed: ${err}`);
+                    }
+                }
             },
         );
 
-        // Show the report
-        reportWebview.show(report);
-
-        // Refresh investigation history
-        await investigationTreeProvider.loadInvestigations();
-
-        if (report.status === 'completed') {
-            vscode.window.showInformationMessage(
-                `Investigation complete: ${report.findings.length} finding(s)`,
-            );
-        } else if (report.status === 'failed') {
-            vscode.window.showErrorMessage(
-                `Investigation failed: ${report.error || 'Unknown error'}`,
-            );
+        if (!cancelled) {
+            await investigationTreeProvider.loadInvestigations();
         }
     } catch (error) {
-        vscode.window.showErrorMessage(`Investigation failed: ${error}`);
+        if (!cancelled) {
+            vscode.window.showErrorMessage(`Investigation failed: ${error}`);
+        }
     }
 }
 

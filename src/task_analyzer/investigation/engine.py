@@ -40,7 +40,7 @@ from task_analyzer.core.audit_logger import AuditLogger
 from task_analyzer.core.rate_limiter import RateLimiter
 from task_analyzer.core.security_guard import SecurityGuard
 from task_analyzer.investigation.evidence_aggregator import EvidenceAggregator
-from task_analyzer.investigation.graph_engine import InvestigationGraph
+from task_analyzer.investigation.graph_engine import GraphBuilder, InvestigationGraph, NodeType
 from task_analyzer.investigation.root_cause_engine import RootCauseEngine
 from task_analyzer.models.schemas import (
     InvestigationFinding,
@@ -411,21 +411,13 @@ class InvestigationEngine:
                     error_type=type(exc).__name__,
                 )
 
-    async def investigate(self, task: Task) -> InvestigationReport:
+    async def investigate(self, task: Task, progress_callback: Any | None = None) -> InvestigationReport:
         """
         Run a full investigation on a task.
 
-        Steps:
-          1. Initialize investigation graph
-          2. Run available skills (repo, ticket, log, database)
-          3. Aggregate evidence and rank root causes
-          4. Build context (task + profile + skill findings + connector context)
-          5. Create tools from active connectors
-          6. Run the LangChain agent (with graceful fallback on failure)
-          7. Parse and return the structured report
-
-        Resilience: If the LLM call fails, the engine produces a partial
-        report from skill evidence rather than failing the entire investigation.
+        Args:
+            task: The task to investigate
+            progress_callback: Optional async callable(stage, message) for live progress
         """
         report = InvestigationReport(
             task_id=task.id,
@@ -434,18 +426,28 @@ class InvestigationEngine:
             model_used=self.config.llm_model,
         )
 
+        async def _emit(stage: str, message: str) -> None:
+            if progress_callback:
+                try:
+                    await progress_callback(stage, message)
+                except Exception:
+                    pass
+
         self.audit.log_investigation_start(task.id, task.title)
         start_time = time.time()
+        await _emit("loading_ticket", "Loading ticket details...")
 
         try:
             # Step 1: Initialize investigation graph
             graph = InvestigationGraph()
-            graph.add_node(task.id, "ticket", {
+            graph.add_node(task.id, NodeType.TICKET, {
+                "label": task.title[:60],
                 "title": task.title,
                 "type": task.task_type.value,
             })
 
             # Step 2: Run available skills
+            await _emit("skills_execution", "Running investigation skills...")
             report.steps.append(InvestigationStep(
                 step_number=1,
                 action="Running investigation skills",
@@ -510,6 +512,7 @@ class InvestigationEngine:
                     )
 
             # Step 3: Aggregate evidence and rank root causes
+            await _emit("evidence_aggregation", "Aggregating evidence...")
             report.steps.append(InvestigationStep(
                 step_number=2,
                 action="Aggregating evidence and ranking root causes",
@@ -522,7 +525,13 @@ class InvestigationEngine:
             root_engine = RootCauseEngine()
             hypotheses = root_engine.analyze(graph.export(), evidence)
 
+            # Step 3b: Build evidence graph
+            await _emit("building_graph", "Building evidence graph...")
+            graph_builder = GraphBuilder()
+            graph_builder.build(graph, task.id, evidence, hypotheses)
+
             # Step 4: Build context (with connector error isolation)
+            await _emit("building_context", "Building investigation context...")
             report.steps.append(InvestigationStep(
                 step_number=3,
                 action="Building investigation context",
@@ -540,6 +549,7 @@ class InvestigationEngine:
             ))
 
             # Step 6: Run the AI investigation (with graceful fallback)
+            await _emit("ai_reasoning", "Running AI reasoning with Claude...")
             report.steps.append(InvestigationStep(
                 step_number=5,
                 action="Running AI analysis",
@@ -608,7 +618,9 @@ class InvestigationEngine:
                     self._build_partial_report(report, task, evidence, hypotheses, skill_errors)
 
             # Attach graph, hypotheses, and evidence to report
+            await _emit("generating_report", "Generating investigation report...")
             report.investigation_graph = graph.export()
+            report.root_cause_node_id = graph.root_cause_node_id
             report.root_cause_hypotheses = [
                 {
                     "description": h.description,

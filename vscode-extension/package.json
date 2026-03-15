@@ -2,7 +2,7 @@
     "name": "traceai",
     "displayName": "TraceAI",
     "description": "AI-powered developer investigation platform — investigate bugs, incidents, and user stories with Claude",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "publisher": "traceai",
     "engines": {
         "vscode": "^1.85.0"
@@ -80,7 +80,7 @@
             "traceai": [
                 {
                     "id": "traceai.tasks",
-                    "name": "Tasks"
+                    "name": "My Tasks"
                 },
                 {
                     "id": "traceai.investigations",

@@ -47,11 +47,20 @@ def main_callback(
 
 @app.command()
 def setup() -> None:
-    """Run the interactive setup wizard to configure Task Analyzer."""
-    from task_analyzer.cli.wizard import SetupWizard
-
-    wizard = SetupWizard()
-    asyncio.run(wizard.run())
+    """Run the interactive setup wizard to configure TraceAI."""
+    # Use the new standalone setup helper
+    import importlib.util
+    setup_path = Path(__file__).resolve().parents[3] / "traceai_setup.py"
+    if setup_path.exists():
+        spec = importlib.util.spec_from_file_location("traceai_setup", setup_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.main()
+    else:
+        # Fallback to the old wizard
+        from task_analyzer.cli.wizard import SetupWizard
+        wizard = SetupWizard()
+        asyncio.run(wizard.run())
 
 
 # ── Tasks Command ─────────────────────────────────────────────────────────────
@@ -303,6 +312,44 @@ def history(
         )
 
     console.print(table)
+
+
+# ── Validate Command ─────────────────────────────────────────────────────────
+
+@app.command()
+def validate() -> None:
+    """Validate all TraceAI components (Claude API, Azure DevOps, SQL, backend)."""
+    asyncio.run(_validate())
+
+
+async def _validate() -> None:
+    from task_analyzer.core.validation import validate_all
+
+    console.print("\n[bold cyan]TraceAI System Validation[/bold cyan]\n")
+
+    with console.status("[bold cyan]Running validation checks..."):
+        results = await validate_all()
+
+    table = Table(title="Validation Results")
+    table.add_column("Component", style="cyan")
+    table.add_column("Status", style="white")
+    table.add_column("Details", style="dim")
+
+    for r in results:
+        status = "[green]OK[/green]" if r.ok else "[red]FAIL[/red]"
+        table.add_row(r.component, status, r.message)
+        if r.details:
+            table.add_row("", "", f"[dim]{r.details[:80]}[/dim]")
+
+    console.print(table)
+
+    ok_count = sum(1 for r in results if r.ok)
+    total = len(results)
+    if ok_count == total:
+        console.print(f"\n[green bold]All {total} components operational.[/green bold]\n")
+    else:
+        console.print(f"\n[yellow]{ok_count}/{total} components operational.[/yellow]")
+        console.print("[dim]Run 'traceai setup' to fix missing components.[/dim]\n")
 
 
 # ── Serve Command ─────────────────────────────────────────────────────────────

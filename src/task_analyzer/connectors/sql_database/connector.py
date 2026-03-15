@@ -75,17 +75,20 @@ class SqlDatabaseConnector(BaseConnector):
         """
         Execute a SQL query (read-only enforced) and return rows as dicts.
 
-        Security: Double validation through SecurityGuard:
-          1. Strip comments to prevent bypass attacks
-          2. Reject compound statements (semicolons)
-          3. First keyword must be SELECT or WITH
-          4. Scan ALL tokens for blocked SQL keywords
+        Security:
+          1. SecurityGuard validates the query (keyword + object blocking)
+          2. SET ROWCOUNT 100 limits result size
+          3. SET LOCK_TIMEOUT 1000 prevents blocking locks
+          4. fetchmany(MAX_ROWS) caps the Python-side result set
         """
         # Validate through SecurityGuard (hardened validation)
         validated_sql = self._security_guard.validate_sql_query(sql)
 
         engine = self._get_engine()
         with engine.connect() as conn:
+            # Apply safety limits before the user query
+            conn.execute(text("SET ROWCOUNT 100"))
+            conn.execute(text("SET LOCK_TIMEOUT 1000"))
             result = conn.execute(text(validated_sql))
             rows = result.mappings().fetchmany(MAX_ROWS)
             return [dict(row) for row in rows]

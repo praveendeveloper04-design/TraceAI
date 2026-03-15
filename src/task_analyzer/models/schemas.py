@@ -226,6 +226,7 @@ class InvestigationReport(BaseModel):
     model_used: str = ""
     error: str | None = None
     investigation_graph: dict | None = None          # Investigation relationship graph
+    root_cause_node_id: str | None = None            # Primary root cause node in graph
     root_cause_hypotheses: list[dict] | None = None  # Ranked root cause hypotheses
     evidence_summary: dict | None = None             # Aggregated evidence from skills
 
