@@ -2,11 +2,21 @@
 Azure DevOps Connector — Fetches work items from Azure DevOps Services / Server.
 
 Uses the Azure DevOps REST API to query work items, boards, and iterations.
-Requires a Personal Access Token (PAT) with Work Items (Read) scope.
+
+Authentication is handled exclusively via Azure CLI (az login).
+The connector acquires a Bearer token by running:
+
+    az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798
+
+No PATs, no Device Code, no Browser OAuth. Azure CLI is the only
+supported authentication method.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
+import subprocess
 from datetime import datetime
 from typing import Any
 
@@ -27,12 +37,128 @@ from task_analyzer.security.credential_manager import CredentialManager
 
 logger = structlog.get_logger(__name__)
 
+# Azure DevOps resource ID for token acquisition
+ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
+
+
+# ─── Azure CLI Discovery ─────────────────────────────────────────────────────
+
+def _find_az_command() -> str:
+    """
+    Find the Azure CLI executable.
+
+    On Windows, 'az' may not be in PATH when invoked from VS Code or
+    non-interactive shells. We check common installation paths.
+    Returns the full path to az.cmd (Windows) or az (Unix).
+    """
+    import shutil
+    import platform as _platform
+
+    is_win = _platform.system() == "Windows"
+
+    # Try PATH first — look for az.cmd on Windows
+    if is_win:
+        az = shutil.which("az.cmd") or shutil.which("az")
+    else:
+        az = shutil.which("az")
+    if az:
+        return az
+
+    # Windows: check known install locations
+    if is_win:
+        candidates = [
+            r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+            r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Azure CLI\wbin\az.cmd"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+
+    raise FileNotFoundError(
+        "Azure CLI is not installed.\n"
+        "Install it from: https://learn.microsoft.com/en-us/cli/azure/install-azure-cli\n"
+        "Then run: az login"
+    )
+
+
+# ─── Token Acquisition (Azure CLI only) ──────────────────────────────────────
+
+async def _acquire_ado_token() -> str:
+    """
+    Acquire an Azure DevOps access token via Azure CLI.
+
+    Runs: az account get-access-token --resource 499b84ac-...
+
+    Raises ValueError if Azure CLI is not installed or user is not logged in.
+    """
+    # Step 1: Find az executable
+    try:
+        az = _find_az_command()
+    except FileNotFoundError as exc:
+        raise ValueError(str(exc))
+
+    logger.debug("azure_cli_found", path=az)
+
+    # Step 2: Check user is logged in
+    try:
+        account_result = await asyncio.to_thread(
+            subprocess.run,
+            [az, "account", "show", "--query", "user.name", "-o", "tsv"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if account_result.returncode != 0:
+            raise ValueError(
+                "You are not logged in to Azure CLI.\n"
+                "Please run: az login\n"
+                "Then retry the operation."
+            )
+        user = account_result.stdout.strip()
+        logger.info("azure_cli_user", user=user)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Azure CLI timed out checking login status.")
+
+    # Step 3: Get access token for Azure DevOps
+    try:
+        token_result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                az, "account", "get-access-token",
+                "--resource", ADO_RESOURCE_ID,
+                "--query", "accessToken",
+                "-o", "tsv",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        if token_result.returncode != 0:
+            stderr = token_result.stderr.strip()
+            raise ValueError(
+                f"Failed to acquire Azure DevOps token.\n"
+                f"Azure CLI error: {stderr[:200]}\n"
+                f"Try: az login --allow-no-subscriptions"
+            )
+        token = token_result.stdout.strip()
+        if not token:
+            raise ValueError("Azure CLI returned an empty token.")
+
+        logger.info(
+            "azure_cli_token_acquired",
+            token_length=len(token),
+            user=user,
+        )
+        return token
+
+    except subprocess.TimeoutExpired:
+        raise ValueError("Azure CLI timed out acquiring token.")
+
+
+# ─── Connector ────────────────────────────────────────────────────────────────
 
 class AzureDevOpsConnector(BaseConnector):
     connector_type = ConnectorType.AZURE_DEVOPS
     display_name = "Azure DevOps"
     description = "Connect to Azure DevOps Services or Server for work item tracking"
-    required_credentials = ["pat"]
+    required_credentials = []  # No stored credentials — uses Azure CLI live tokens
     optional_credentials = []
 
     def __init__(self, config: ConnectorConfig, credential_manager: CredentialManager) -> None:
@@ -45,28 +171,32 @@ class AzureDevOpsConnector(BaseConnector):
         )
         self._org_url = f"https://dev.azure.com/{self._org}"
         self._client: httpx.AsyncClient | None = None
+        self._token: str | None = None
+
+    async def _acquire_token(self) -> str:
+        """Acquire a fresh Azure DevOps Bearer token via Azure CLI."""
+        if self._token:
+            return self._token
+        self._token = await _acquire_ado_token()
+        return self._token
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            pat = self._get_credential("pat")
-            if not pat:
-                raise ValueError(
-                    "Azure DevOps PAT not found. Checked: OS keychain, "
-                    "~/.traceai/credentials.json, config.json settings. "
-                    "Please run 'traceai setup' or create credentials.json."
-                )
+            token = await self._acquire_token()
             logger.info(
                 "azure_devops_auth",
                 org=self._org,
                 project=self._project,
                 base_url=self._base_url,
-                pat_length=len(pat),
-                pat_prefix=pat[:4] + "..." if len(pat) > 4 else "****",
+                auth_method="azure_cli_bearer",
+                token_length=len(token),
             )
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
-                auth=("", pat),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
                 timeout=30.0,
             )
         return self._client
@@ -75,25 +205,18 @@ class AzureDevOpsConnector(BaseConnector):
         """
         Validate the connection by calling the org-level projects endpoint.
 
-        Note: /_apis/projects is an organization-scoped endpoint. It must be
-        called against the org URL (dev.azure.com/{org}), NOT the project URL
-        (dev.azure.com/{org}/{project}). Calling it with the project in the
-        path returns 401 on Azure DevOps Services.
-
-        We use a separate one-shot request here because the main client's
-        base_url is project-scoped (which is correct for WIQL and work item
-        APIs), but the projects endpoint lives at the org level.
+        /_apis/projects is organization-scoped — must be called against
+        dev.azure.com/{org}, not dev.azure.com/{org}/{project}.
         """
-        pat = self._get_credential("pat")
-        if not pat:
-            raise ValueError(
-                "Azure DevOps PAT not found. Checked: OS keychain, "
-                "~/.traceai/credentials.json, config.json settings."
-            )
+        token = await self._acquire_token()
         url = f"{self._org_url}/_apis/projects?api-version=7.1"
         logger.info("azure_devops_validating", url=url)
-        async with httpx.AsyncClient(auth=("", pat), timeout=30.0) as client:
-            resp = await client.get(url)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
         if resp.status_code != 200:
             logger.error(
                 "azure_devops_auth_failed",
@@ -102,7 +225,7 @@ class AzureDevOpsConnector(BaseConnector):
                 url=url,
             )
         resp.raise_for_status()
-        # Now initialize the project-scoped client for all subsequent calls
+        # Initialize the project-scoped client for subsequent calls
         await self._get_client()
         logger.info("azure_devops_connected", org=self._org, project=self._project)
         self._connected = True
@@ -116,14 +239,25 @@ class AzureDevOpsConnector(BaseConnector):
     ) -> list[Task]:
         client = await self._get_client()
 
-        # Build WIQL query
-        conditions = ["[System.TeamProject] = @project"]
+        # Build WIQL query — default to @Me (current authenticated user)
+        conditions = [
+            "[System.TeamProject] = @project",
+            "[System.WorkItemType] IN ('Task', 'Bug', 'User Story', 'Issue', 'Feature')",
+        ]
         if assigned_to:
             conditions.append(f"[System.AssignedTo] = '{assigned_to}'")
+        else:
+            # @Me resolves to the authenticated Azure CLI user
+            conditions.append("[System.AssignedTo] = @Me")
         if query:
             conditions.append(f"[System.Title] CONTAINS '{query}'")
 
-        wiql = f"SELECT [System.Id] FROM WorkItems WHERE {' AND '.join(conditions)} ORDER BY [System.ChangedDate] DESC"
+        wiql = (
+            "SELECT [System.Id], [System.Title], [System.State], "
+            "[System.WorkItemType], [System.AssignedTo] "
+            f"FROM WorkItems WHERE {' AND '.join(conditions)} "
+            "ORDER BY [System.ChangedDate] DESC"
+        )
 
         resp = await client.post(
             "/_apis/wit/wiql?api-version=7.1",
@@ -135,7 +269,6 @@ class AzureDevOpsConnector(BaseConnector):
         if not work_item_refs:
             return []
 
-        # Batch fetch work item details
         ids = ",".join(str(wi["id"]) for wi in work_item_refs)
         fields = "System.Id,System.Title,System.Description,System.WorkItemType,System.State,System.AssignedTo,System.CreatedBy,System.CreatedDate,System.ChangedDate,System.Tags,Microsoft.VSTS.Common.Severity"
         resp = await client.get(
@@ -160,7 +293,6 @@ class AzureDevOpsConnector(BaseConnector):
 
         task = self._map_work_item(wi)
 
-        # Fetch comments
         comments_resp = await client.get(
             f"/_apis/wit/workitems/{task_id}/comments?api-version=7.1-preview.4"
         )
@@ -183,12 +315,11 @@ class AzureDevOpsConnector(BaseConnector):
         client = await self._get_client()
         context_parts = []
 
-        # Get work item updates (history)
         resp = await client.get(
             f"/_apis/wit/workitems/{task.external_id}/updates?api-version=7.1"
         )
         if resp.status_code == 200:
-            updates = resp.json().get("value", [])[-10:]  # last 10 updates
+            updates = resp.json().get("value", [])[-10:]
             if updates:
                 context_parts.append("## Recent History")
                 for u in updates:
@@ -196,7 +327,7 @@ class AzureDevOpsConnector(BaseConnector):
                     if "System.State" in fields:
                         old = fields["System.State"].get("oldValue", "?")
                         new = fields["System.State"].get("newValue", "?")
-                        context_parts.append(f"- State changed: {old} → {new}")
+                        context_parts.append(f"- State changed: {old} -> {new}")
 
         return "\n".join(context_parts)
 
@@ -204,6 +335,7 @@ class AzureDevOpsConnector(BaseConnector):
         if self._client:
             await self._client.aclose()
             self._client = None
+        self._token = None
         self._connected = False
 
     # ── Mapping Helpers ───────────────────────────────────────────────────
@@ -241,13 +373,6 @@ class AzureDevOpsConnector(BaseConnector):
                 "key": "project",
                 "prompt": "Azure DevOps project name",
                 "secret": False,
-                "required": True,
-                "default": None,
-            },
-            {
-                "key": "pat",
-                "prompt": "Personal Access Token (PAT) with Work Items Read scope",
-                "secret": True,
                 "required": True,
                 "default": None,
             },

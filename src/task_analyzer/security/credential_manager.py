@@ -12,7 +12,6 @@ Credential resolution order (first match wins):
      Structure:
        {
          "anthropic": { "api_key": "sk-ant-..." },
-         "azure_devops": { "pat": "..." },
          "sql_database": { "connection_string": "..." }
        }
 
