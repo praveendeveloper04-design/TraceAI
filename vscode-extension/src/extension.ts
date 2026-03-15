@@ -1,17 +1,14 @@
 /**
- * TraceAI — VS Code Extension Entry Point
+ * TraceAI -- VS Code Extension Entry Point
  *
- * Single entry point with full auto-detect flow:
- *   1. Auto-bootstrap Python environment (~/.traceai/runtime/venv)
- *   2. Auto-install backend from bundled extension package
- *   3. Auto-start Python backend (with crash recovery)
- *   4. Check configuration status
- *   5. Load cached tasks instantly (fast startup)
- *   6. Fetch fresh tasks async
- *   7. Background refresh every 5 minutes
- *
- * Teammates install the .vsix and everything works automatically.
- * No repo clone or manual setup required.
+ * Features:
+ *   - Multi-tab investigations (each task gets its own panel)
+ *   - Live progress with animated stages
+ *   - Cancel running investigations
+ *   - Re-run investigations
+ *   - Delete single or all investigation history
+ *   - Auto-bootstrap Python backend
+ *   - Background task refresh every 5 minutes
  */
 
 import * as vscode from 'vscode';
@@ -19,17 +16,17 @@ import { ApiService, TaskItem, InvestigationSummary } from './services/apiServic
 import { ServerManager } from './services/serverManager';
 import { StateManager } from './services/stateManager';
 import { TaskCache } from './services/taskCache';
+import { PanelManager } from './services/panelManager';
 import { TaskTreeProvider } from './providers/taskTreeProvider';
 import { InvestigationTreeProvider } from './providers/investigationTreeProvider';
-import { ReportWebview } from './views/reportWebview';
 
 let apiService: ApiService;
 let serverManager: ServerManager;
 let stateManager: StateManager;
 let taskCache: TaskCache;
+let panelManager: PanelManager;
 let taskTreeProvider: TaskTreeProvider;
 let investigationTreeProvider: InvestigationTreeProvider;
-let reportWebview: ReportWebview;
 let statusBarItem: vscode.StatusBarItem;
 let refreshInterval: ReturnType<typeof setInterval> | undefined;
 
@@ -37,77 +34,78 @@ export function activate(context: vscode.ExtensionContext): void {
     const config = vscode.workspace.getConfiguration('traceai');
     const port = config.get<number>('serverPort', 7420);
 
-    // Initialize services — pass extensionPath so ServerManager can find bundled backend
+    // Initialize services
     apiService = new ApiService(port);
     serverManager = new ServerManager(port, context.extensionPath);
     stateManager = new StateManager(context.globalState);
     taskCache = new TaskCache();
+    panelManager = new PanelManager(context.extensionUri, apiService);
     taskTreeProvider = new TaskTreeProvider(apiService);
     investigationTreeProvider = new InvestigationTreeProvider(apiService);
-    reportWebview = new ReportWebview(context.extensionUri, apiService);
 
-    // Create status bar item
+    // Status bar
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     statusBarItem.command = 'traceai.showStatus';
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    // Register tree views
+    // Tree views
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('traceai.tasks', taskTreeProvider),
         vscode.window.registerTreeDataProvider('traceai.investigations', investigationTreeProvider),
     );
 
-    // ── Register Commands ────────────────────────────────────────────────
+    // ── Commands ─────────────────────────────────────────────────────────
 
-    // Setup wizard — uses the venv Python to run task-analyzer setup
+    // Setup
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.setup', async () => {
             const terminal = vscode.window.createTerminal('TraceAI Setup');
             terminal.show();
             const venvPython = serverManager.getVenvPython();
-            // Use & (call operator) for PowerShell compatibility.
-            // PowerShell cannot invoke a quoted path directly — "path" -m fails.
-            // & "path" -m works in PowerShell AND cmd/bash ignore the & harmlessly.
             terminal.sendText(`& "${venvPython}" -m task_analyzer.cli.main setup`);
         }),
     );
 
-    // Fetch tasks (refresh)
+    // Refresh tasks
     context.subscriptions.push(
-        vscode.commands.registerCommand('traceai.refresh', async () => {
-            await refreshTasks();
-        }),
+        vscode.commands.registerCommand('traceai.refresh', () => refreshTasks()),
+        vscode.commands.registerCommand('traceai.refreshTasks', () => refreshTasks()),
     );
 
-    // Backward-compatible alias
-    context.subscriptions.push(
-        vscode.commands.registerCommand('traceai.refreshTasks', async () => {
-            await refreshTasks();
-        }),
-    );
-
-    // Investigate (from command palette)
+    // Investigate from command palette
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.investigate', async () => {
             const taskId = await vscode.window.showInputBox({
                 prompt: 'Enter the task ID to investigate',
                 placeHolder: 'e.g., 12345 or PROJ-123',
             });
-            if (taskId) {
-                await investigateTask(taskId);
-            }
+            if (taskId) { await investigateTask(taskId, taskId); }
         }),
     );
 
-    // Investigate from tree view
+    // Investigate from task tree
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.investigateFromTree', async (task: TaskItem) => {
-            await investigateTask(task.external_id);
+            await investigateTask(task.external_id, task.title);
         }),
     );
 
-    // View report (from command palette)
+    // Investigate by ID (for re-run)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.investigateFromId', async (taskId: string) => {
+            await investigateTask(taskId, taskId);
+        }),
+    );
+
+    // View report from tree
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.viewReportFromTree', async (inv: InvestigationSummary) => {
+            await panelManager.openSavedReport(inv.id);
+        }),
+    );
+
+    // View report from command palette
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.viewReport', async () => {
             try {
@@ -116,125 +114,136 @@ export function activate(context: vscode.ExtensionContext): void {
                     vscode.window.showInformationMessage('No investigations found.');
                     return;
                 }
-
                 const items = investigations.map(inv => ({
                     label: inv.task_title || 'Unknown',
                     description: `${inv.status} \u00b7 ${inv.started_at?.substring(0, 10) || ''}`,
-                    detail: `ID: ${inv.id}`,
                     id: inv.id,
                 }));
-
-                const selected = await vscode.window.showQuickPick(items, {
-                    placeHolder: 'Select an investigation to view',
-                });
-
-                if (selected) {
-                    await viewReport(selected.id);
-                }
+                const selected = await vscode.window.showQuickPick(items, { placeHolder: 'Select investigation' });
+                if (selected) { await panelManager.openSavedReport(selected.id); }
             } catch (error) {
-                vscode.window.showErrorMessage(`Failed to load investigations: ${error}`);
+                vscode.window.showErrorMessage(`Failed: ${error}`);
             }
         }),
     );
 
-    // View report from tree
+    // Delete single investigation
     context.subscriptions.push(
-        vscode.commands.registerCommand('traceai.viewReportFromTree', async (inv: InvestigationSummary) => {
-            await viewReport(inv.id);
+        vscode.commands.registerCommand('traceai.deleteInvestigation', async (item: any) => {
+            const inv = item?.investigation || item;
+            if (!inv?.id) { return; }
+            const confirm = await vscode.window.showWarningMessage(
+                `Delete investigation "${inv.task_title || inv.id}"?`,
+                { modal: true }, 'Delete',
+            );
+            if (confirm === 'Delete') {
+                try {
+                    await apiService.deleteInvestigation(inv.id);
+                    vscode.window.showInformationMessage('Investigation deleted.');
+                    await investigationTreeProvider.loadInvestigations();
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Failed to delete: ${error}`);
+                }
+            }
         }),
     );
 
-    // History
+    // Delete all investigation history
     context.subscriptions.push(
-        vscode.commands.registerCommand('traceai.history', async () => {
-            await investigationTreeProvider.loadInvestigations();
+        vscode.commands.registerCommand('traceai.deleteInvestigationHistory', async () => {
+            const confirm = await vscode.window.showWarningMessage(
+                'Delete all investigation history? This cannot be undone.',
+                { modal: true }, 'Delete All',
+            );
+            if (confirm === 'Delete All') {
+                try {
+                    const result = await apiService.deleteAllInvestigations();
+                    vscode.window.showInformationMessage(`Deleted ${result.deleted} investigation(s).`);
+                    await investigationTreeProvider.loadInvestigations();
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Failed: ${error}`);
+                }
+            }
         }),
     );
 
-    // Show Status
+    // Re-run investigation
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.rerunInvestigation', async (item: any) => {
+            const inv = item?.investigation || item;
+            if (!inv?.task_id) { return; }
+            await investigateTask(inv.task_id, inv.task_title || inv.task_id);
+        }),
+    );
+
+    // Cancel investigation (placeholder -- cancel is via notification bar)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.cancelInvestigation', async (item: any) => {
+            const inv = item?.investigation || item;
+            if (!inv?.id) { return; }
+            try {
+                await apiService.cancelInvestigation(inv.id);
+                vscode.window.showInformationMessage('Investigation cancelled.');
+                await investigationTreeProvider.loadInvestigations();
+            } catch (error) {
+                vscode.window.showErrorMessage(`Failed to cancel: ${error}`);
+            }
+        }),
+    );
+
+    // History refresh
+    context.subscriptions.push(
+        vscode.commands.registerCommand('traceai.history', () => investigationTreeProvider.loadInvestigations()),
+    );
+
+    // Show status
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.showStatus', async () => {
             try {
                 const status = await apiService.getStatus();
-                const message = [
-                    `TraceAI v${status.version}`,
-                    `Configured: ${status.configured ? 'Yes' : 'No'}`,
-                    `Ticket Source: ${status.ticket_source || 'None'}`,
-                    `Repositories: ${status.repositories}`,
-                    `Connectors: ${status.connectors}`,
-                    `Profiles: ${status.profiles}`,
-                ].join('\n');
-
-                vscode.window.showInformationMessage(message, { modal: true });
+                vscode.window.showInformationMessage(
+                    `TraceAI v${status.version} | ${status.configured ? 'Configured' : 'Not configured'} | ${status.ticket_source || 'No source'}`,
+                    { modal: true },
+                );
             } catch {
-                vscode.window.showWarningMessage(
-                    'TraceAI server is not running.',
-                    'Start Server',
-                ).then(action => {
-                    if (action === 'Start Server') {
-                        mainFlow();
-                    }
+                vscode.window.showWarningMessage('TraceAI server is not running.', 'Start Server').then(a => {
+                    if (a) { mainFlow(); }
                 });
             }
         }),
+        vscode.commands.registerCommand('traceai.status', () => vscode.commands.executeCommand('traceai.showStatus')),
     );
 
-    // Backward-compatible alias
-    context.subscriptions.push(
-        vscode.commands.registerCommand('traceai.status', async () => {
-            vscode.commands.executeCommand('traceai.showStatus');
-        }),
-    );
-
-    // ── Run main flow ────────────────────────────────────────────────────
+    // ── Startup ──────────────────────────────────────────────────────────
 
     mainFlow();
 
-    // ── Background refresh ───────────────────────────────────────────────
-
-    refreshInterval = setInterval(() => {
-        refreshTasks().catch(() => {
-            // Silently fail on background refresh
-        });
-    }, 5 * 60 * 1000); // 5 minutes
-
-    context.subscriptions.push({
-        dispose: () => {
-            if (refreshInterval) {
-                clearInterval(refreshInterval);
-            }
-        },
-    });
+    // Background refresh
+    refreshInterval = setInterval(() => { refreshTasks().catch(() => {}); }, 5 * 60 * 1000);
+    context.subscriptions.push({ dispose: () => { if (refreshInterval) { clearInterval(refreshInterval); } } });
 }
 
 // ── Main Flow ────────────────────────────────────────────────────────────────
 
 async function mainFlow(): Promise<void> {
-    // A. Status bar: Starting
     statusBarItem.text = '$(loading~spin) TraceAI: Starting backend...';
 
-    // B. Bootstrap and start server (Python detection, venv, install, start)
     const serverRunning = await serverManager.ensureRunning();
     if (!serverRunning) {
         statusBarItem.text = '$(error) TraceAI: Server offline';
         return;
     }
-
     statusBarItem.text = '$(check) TraceAI: Connected';
 
-    // C. Check if configured — prompt setup if not
     try {
         const status = await apiService.getStatus();
         if (!status.configured) {
             statusBarItem.text = '$(gear) TraceAI: Setup required';
             const action = await vscode.window.showInformationMessage(
                 'Welcome to TraceAI! Run the setup wizard to connect your ticket source and AI key.',
-                'Run Setup',
-                'Later',
+                'Run Setup', 'Later',
             );
-            if (action === 'Run Setup') {
-                vscode.commands.executeCommand('traceai.setup');
-            }
+            if (action === 'Run Setup') { vscode.commands.executeCommand('traceai.setup'); }
             return;
         }
     } catch {
@@ -243,93 +252,65 @@ async function mainFlow(): Promise<void> {
     }
 
     statusBarItem.text = '$(loading~spin) TraceAI: Loading tasks...';
-    const cachedTasks = await taskCache.loadCached();
-    if (cachedTasks.length > 0) {
-        taskTreeProvider.setTasks(cachedTasks);
-        statusBarItem.text = `$(check) TraceAI: ${cachedTasks.length} tasks (cached)`;
+    const cached = await taskCache.loadCached();
+    if (cached.length > 0) {
+        taskTreeProvider.setTasks(cached);
+        statusBarItem.text = `$(check) TraceAI: ${cached.length} tasks (cached)`;
     }
 
-    // E. Fetch fresh tasks async
     await refreshTasks();
-
-    // F. Load investigation history
-    try {
-        await investigationTreeProvider.loadInvestigations();
-    } catch {
-        // Silently fail
-    }
-
-    // G. Populate sidebar complete
+    try { await investigationTreeProvider.loadInvestigations(); } catch {}
     stateManager.markFirstRunComplete();
 }
 
-// ── Helper Functions ─────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 async function refreshTasks(): Promise<void> {
     const config = vscode.workspace.getConfiguration('traceai');
     const assignee = stateManager.getAssignee() || config.get<string>('defaultAssignee', '');
-
     try {
-        const tasks = await apiService.fetchTasks(
-            assignee || undefined,
-            undefined,
-            50,
-            ['new', 'active', 'in_progress', 'unknown'],
-        );
+        const tasks = await apiService.fetchTasks(assignee || undefined, undefined, 50, ['new', 'active', 'in_progress', 'unknown']);
         taskTreeProvider.setTasks(tasks);
         await taskCache.save(tasks);
         statusBarItem.text = `$(check) TraceAI: ${tasks.length} tasks`;
-    } catch (error) {
-        // Don't overwrite status bar if we have cached data
+    } catch {
         const cached = await taskCache.loadCached();
-        if (cached.length === 0) {
-            statusBarItem.text = '$(warning) TraceAI: Fetch failed';
-        }
+        if (cached.length === 0) { statusBarItem.text = '$(warning) TraceAI: Fetch failed'; }
     }
 }
 
-async function investigateTask(taskId: string): Promise<void> {
-    // Open the webview immediately with a live progress panel
-    reportWebview.showProgress(taskId);
+async function investigateTask(taskId: string, taskTitle: string): Promise<void> {
+    // Open a dedicated panel for this investigation
+    const panel = panelManager.openProgress(taskId, taskTitle);
 
     let cancelled = false;
 
     try {
         await vscode.window.withProgress(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: `Investigating ticket ${taskId}`,
-                cancellable: true,
-            },
+            { location: vscode.ProgressLocation.Notification, title: `Investigating ${taskId}`, cancellable: true },
             async (progress, token) => {
-                // Cancel button handler
                 token.onCancellationRequested(() => {
                     cancelled = true;
-                    reportWebview.updateProgress('cancelled', 'Investigation cancelled by user.');
-                    vscode.window.showInformationMessage('Investigation cancelled.');
+                    panelManager.updateProgress(taskId, 'cancelled', 'Investigation cancelled.', 'cancelled');
                 });
 
-                // Simulate live progress stages while the API call runs
+                // Animate stages while API runs
                 const stages = [
-                    { stage: 'loading_ticket', msg: 'Loading ticket details...', ms: 600 },
-                    { stage: 'skills_execution', msg: 'Running investigation skills...', ms: 1500 },
-                    { stage: 'evidence_aggregation', msg: 'Aggregating evidence...', ms: 1000 },
-                    { stage: 'building_graph', msg: 'Building evidence graph...', ms: 800 },
-                    { stage: 'building_context', msg: 'Building investigation context...', ms: 800 },
-                    { stage: 'ai_reasoning', msg: 'Running AI reasoning with Claude...', ms: 0 },
+                    { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
+                    { key: 'skills_execution', label: 'Running skills...', ms: 1200 },
+                    { key: 'evidence_aggregation', label: 'Aggregating evidence...', ms: 800 },
+                    { key: 'building_graph', label: 'Building graph...', ms: 600 },
+                    { key: 'building_context', label: 'Building context...', ms: 600 },
+                    { key: 'ai_reasoning', label: 'AI reasoning...', ms: 0 },
                 ];
 
-                // Advance stages in parallel with the API call
                 const advanceStages = async () => {
                     for (const s of stages) {
                         if (cancelled) { return; }
-                        progress.report({ message: s.msg, increment: 14 });
-                        reportWebview.updateProgress(s.stage, s.msg);
-                        if (s.ms > 0) {
-                            await new Promise(r => setTimeout(r, s.ms));
-                        } else {
-                            break; // Wait for API from here
-                        }
+                        progress.report({ message: s.label, increment: 14 });
+                        panelManager.updateProgress(taskId, s.key, s.label);
+                        if (s.ms > 0) { await new Promise(r => setTimeout(r, s.ms)); }
+                        else { break; }
                     }
                 };
 
@@ -343,57 +324,32 @@ async function investigateTask(taskId: string): Promise<void> {
                     const report = await apiPromise;
                     if (cancelled) { return; }
 
-                    // Final stages
-                    reportWebview.updateProgress('generating_report', 'Generating report...');
-                    progress.report({ message: 'Generating report...', increment: 14 });
+                    panelManager.updateProgress(taskId, 'generating_report', 'Generating report...');
                     await new Promise(r => setTimeout(r, 400));
+                    panelManager.updateProgress(taskId, 'complete', 'Investigation complete!', 'complete');
+                    await new Promise(r => setTimeout(r, 600));
 
-                    reportWebview.updateProgress('complete', 'Investigation complete!');
-                    await new Promise(r => setTimeout(r, 500));
-
-                    // Replace progress with the full report
-                    reportWebview.show(report);
+                    panelManager.showReport(taskId, report);
 
                     if (report.status === 'completed') {
-                        vscode.window.showInformationMessage(
-                            `Investigation complete: ${report.findings.length} finding(s)`,
-                        );
-                    } else if (report.status === 'failed') {
-                        vscode.window.showErrorMessage(
-                            `Investigation failed: ${report.error || 'Unknown error'}`,
-                        );
+                        vscode.window.showInformationMessage(`Investigation complete: ${report.findings?.length || 0} finding(s)`);
                     }
                 } catch (err) {
                     if (!cancelled) {
-                        reportWebview.updateProgress('error', `Failed: ${err}`);
+                        panelManager.updateProgress(taskId, 'error', `Failed: ${err}`, 'error');
                         vscode.window.showErrorMessage(`Investigation failed: ${err}`);
                     }
                 }
             },
         );
 
-        if (!cancelled) {
-            await investigationTreeProvider.loadInvestigations();
-        }
+        if (!cancelled) { await investigationTreeProvider.loadInvestigations(); }
     } catch (error) {
-        if (!cancelled) {
-            vscode.window.showErrorMessage(`Investigation failed: ${error}`);
-        }
-    }
-}
-
-async function viewReport(reportId: string): Promise<void> {
-    try {
-        const report = await apiService.getInvestigation(reportId);
-        reportWebview.show(report);
-    } catch (error) {
-        vscode.window.showErrorMessage(`Failed to load report: ${error}`);
+        if (!cancelled) { vscode.window.showErrorMessage(`Investigation failed: ${error}`); }
     }
 }
 
 export function deactivate(): void {
-    if (refreshInterval) {
-        clearInterval(refreshInterval);
-    }
+    if (refreshInterval) { clearInterval(refreshInterval); }
     serverManager?.dispose();
 }

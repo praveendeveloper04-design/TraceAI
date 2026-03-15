@@ -70,6 +70,18 @@ export interface InvestigationSummary {
     started_at: string;
 }
 
+export interface InvestigationStatus {
+    id: string;
+    task_id: string;
+    task_title: string;
+    status: string;
+    step: string;
+    progress: number;
+    logs: Array<{ time: string; message: string }>;
+    started_at: string;
+    finished_at: string | null;
+}
+
 export class ApiService {
     private client: AxiosInstance;
 
@@ -201,6 +213,24 @@ export class ApiService {
     async getInvestigationMarkdown(reportId: string): Promise<string> {
         const resp = await this.client.get(`/api/investigations/${reportId}/markdown`);
         return resp.data.markdown;
+    }
+
+    async deleteInvestigation(reportId: string): Promise<void> {
+        await this.client.delete(`/api/investigations/${reportId}`);
+    }
+
+    async deleteAllInvestigations(): Promise<{ deleted: number }> {
+        const resp = await this.client.delete('/api/investigations');
+        return resp.data;
+    }
+
+    async getInvestigationStatus(investigationId: string): Promise<InvestigationStatus> {
+        const resp = await this.client.get(`/api/investigation/${investigationId}/status`);
+        return resp.data;
+    }
+
+    async cancelInvestigation(investigationId: string): Promise<void> {
+        await this.client.post(`/api/investigation/${investigationId}/cancel`);
     }
 
     async isServerRunning(): Promise<boolean> {

@@ -2,7 +2,7 @@
     "name": "traceai",
     "displayName": "TraceAI",
     "description": "AI-powered developer investigation platform — investigate bugs, incidents, and user stories with Claude",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "publisher": "traceai",
     "engines": {
         "vscode": "^1.85.0"
@@ -26,46 +26,18 @@
     "main": "./out/extension.js",
     "contributes": {
         "commands": [
-            {
-                "command": "traceai.setup",
-                "title": "TraceAI: Run Setup Wizard",
-                "icon": "$(gear)"
-            },
-            {
-                "command": "traceai.refresh",
-                "title": "TraceAI: Refresh Tasks",
-                "icon": "$(refresh)"
-            },
-            {
-                "command": "traceai.refreshTasks",
-                "title": "TraceAI: Refresh Tasks",
-                "icon": "$(refresh)"
-            },
-            {
-                "command": "traceai.investigate",
-                "title": "TraceAI: Investigate Task",
-                "icon": "$(search)"
-            },
-            {
-                "command": "traceai.viewReport",
-                "title": "TraceAI: View Investigation Report",
-                "icon": "$(file-text)"
-            },
-            {
-                "command": "traceai.showStatus",
-                "title": "TraceAI: Show Status",
-                "icon": "$(info)"
-            },
-            {
-                "command": "traceai.status",
-                "title": "TraceAI: Show Status",
-                "icon": "$(info)"
-            },
-            {
-                "command": "traceai.history",
-                "title": "TraceAI: Investigation History",
-                "icon": "$(history)"
-            }
+            { "command": "traceai.setup", "title": "TraceAI: Run Setup Wizard", "icon": "$(gear)" },
+            { "command": "traceai.refresh", "title": "TraceAI: Refresh Tasks", "icon": "$(refresh)" },
+            { "command": "traceai.refreshTasks", "title": "TraceAI: Refresh Tasks", "icon": "$(refresh)" },
+            { "command": "traceai.investigate", "title": "TraceAI: Investigate Task", "icon": "$(search)" },
+            { "command": "traceai.viewReport", "title": "TraceAI: View Investigation Report", "icon": "$(file-text)" },
+            { "command": "traceai.showStatus", "title": "TraceAI: Show Status", "icon": "$(info)" },
+            { "command": "traceai.status", "title": "TraceAI: Show Status", "icon": "$(info)" },
+            { "command": "traceai.history", "title": "TraceAI: Refresh History", "icon": "$(history)" },
+            { "command": "traceai.deleteInvestigation", "title": "Delete Investigation", "icon": "$(trash)" },
+            { "command": "traceai.deleteInvestigationHistory", "title": "TraceAI: Delete All History", "icon": "$(clear-all)" },
+            { "command": "traceai.rerunInvestigation", "title": "Re-run Investigation", "icon": "$(debug-restart)" },
+            { "command": "traceai.cancelInvestigation", "title": "Cancel Investigation", "icon": "$(debug-stop)" }
         ],
         "viewsContainers": {
             "activitybar": [
@@ -90,23 +62,16 @@
         },
         "menus": {
             "view/title": [
-                {
-                    "command": "traceai.refresh",
-                    "when": "view == traceai.tasks",
-                    "group": "navigation"
-                },
-                {
-                    "command": "traceai.setup",
-                    "when": "view == traceai.tasks",
-                    "group": "navigation"
-                }
+                { "command": "traceai.refresh", "when": "view == traceai.tasks", "group": "navigation" },
+                { "command": "traceai.setup", "when": "view == traceai.tasks", "group": "navigation" },
+                { "command": "traceai.history", "when": "view == traceai.investigations", "group": "navigation" },
+                { "command": "traceai.deleteInvestigationHistory", "when": "view == traceai.investigations", "group": "navigation" }
             ],
             "view/item/context": [
-                {
-                    "command": "traceai.investigate",
-                    "when": "viewItem == task",
-                    "group": "inline"
-                }
+                { "command": "traceai.investigate", "when": "viewItem == task", "group": "inline" },
+                { "command": "traceai.deleteInvestigation", "when": "viewItem == investigation", "group": "1_actions" },
+                { "command": "traceai.rerunInvestigation", "when": "viewItem == investigation", "group": "1_actions" },
+                { "command": "traceai.cancelInvestigation", "when": "viewItem == investigation", "group": "1_actions" }
             ]
         },
         "configuration": {
