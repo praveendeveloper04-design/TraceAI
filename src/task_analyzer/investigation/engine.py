@@ -58,6 +58,7 @@ from task_analyzer.skills.skill_registry import SkillRegistry
 from task_analyzer.skills.ticket_context import TicketContextSkill
 from task_analyzer.skills.cross_repo_analysis import CrossRepoAnalysisSkill
 from task_analyzer.skills.database_schema import DatabaseSchemaSkill
+from task_analyzer.skills.sql_query import SQLQuerySkill
 
 logger = structlog.get_logger(__name__)
 
@@ -388,6 +389,7 @@ class InvestigationEngine:
         self.skill_registry.register(DatabaseAnalysisSkill())
         self.skill_registry.register(CrossRepoAnalysisSkill())
         self.skill_registry.register(DatabaseSchemaSkill())
+        self.skill_registry.register(SQLQuerySkill())
 
         # Load workspace profile for cross-repo awareness
         self._workspace_summary = ""
@@ -473,6 +475,38 @@ class InvestigationEngine:
         await _emit("loading_ticket", "Loading ticket details...")
 
         try:
+            # Step 0: Run investigation planner
+            investigation_plan = None
+            try:
+                from task_analyzer.investigation.planner import InvestigationPlanner
+                planner = InvestigationPlanner()
+                investigation_plan = planner.plan(task.title, task.description)
+                logger.info(
+                    "investigation_plan_ready",
+                    systems=investigation_plan.systems,
+                    repos=investigation_plan.repos,
+                    tables=investigation_plan.tables,
+                    keywords=investigation_plan.matched_keywords,
+                )
+
+                # Load additional repos identified by planner
+                if investigation_plan.repos:
+                    from task_analyzer.storage.local_store import LocalStore
+                    from task_analyzer.knowledge.scanner import RepositoryScanner
+                    store = LocalStore()
+                    for repo_name in investigation_plan.repos:
+                        # Check if already loaded
+                        already = any(
+                            p.repo_name == repo_name for p in self.profiles
+                        )
+                        if not already:
+                            cached = store.load_profile(repo_name)
+                            if cached:
+                                self.profiles.append(cached)
+                                logger.info("planner_loaded_repo", repo=repo_name, source="cache")
+            except Exception as exc:
+                logger.debug("planner_skipped", error=str(exc))
+
             # Step 1: Initialize investigation graph
             graph = InvestigationGraph()
             graph.add_node(task.id, NodeType.TICKET, {
@@ -495,6 +529,8 @@ class InvestigationEngine:
             skill_errors: list[str] = []
 
             skill_context = {"profiles": self.profiles}
+            if investigation_plan:
+                skill_context["investigation_plan"] = investigation_plan
 
             for skill in available_skills:
                 skill_start = time.time()
@@ -573,7 +609,7 @@ class InvestigationEngine:
                 reasoning="Gathering task details, project knowledge, skill findings, and connector context",
             ))
             context = await self._build_context(
-                task, evidence, aggregator, graph, skill_results
+                task, evidence, aggregator, graph, skill_results, investigation_plan
             )
 
             # Step 5: Create tools (only from healthy connectors)
@@ -777,12 +813,28 @@ class InvestigationEngine:
         aggregator: EvidenceAggregator | None = None,
         graph: InvestigationGraph | None = None,
         skill_results: dict | None = None,
+        investigation_plan: Any | None = None,
     ) -> str:
         """Assemble the full context for the investigation."""
         parts = [
             "# Task Under Investigation",
             task.full_context,
         ]
+
+        # Add system architecture from system_map.json
+        try:
+            from task_analyzer.investigation.planner import load_system_map
+            system_map = load_system_map()
+            if system_map.services:
+                parts.append(f"\n# {system_map.summarize()}")
+        except Exception:
+            pass
+
+        # Add investigation plan
+        if investigation_plan and hasattr(investigation_plan, "summarize"):
+            plan_summary = investigation_plan.summarize()
+            if plan_summary:
+                parts.append(f"\n# {plan_summary}")
 
         # Add workspace architecture (cross-repo awareness)
         if self._workspace_summary:
@@ -808,6 +860,23 @@ class InvestigationEngine:
                 parts.append("\n# Related Services")
                 for svc in cross["related_services"]:
                     parts.append(f"- **{svc['name']}** in {svc.get('repo', '?')} (`{svc.get('path', '?')}`)")
+
+        # Add SQL query results from SQLQuerySkill
+        if skill_results and "sql_query" in skill_results:
+            sql_data = skill_results["sql_query"]
+            query_results = sql_data.get("query_results", [])
+            if query_results:
+                parts.append("\n# SQL Query Results")
+                for qr in query_results[:5]:
+                    table = qr.get("table", "?")
+                    rows = qr.get("row_count", 0)
+                    cols = qr.get("columns", [])
+                    parts.append(f"\n### {table} ({rows} rows)")
+                    if cols:
+                        parts.append(f"Columns: {', '.join(cols[:15])}")
+                    for row in qr.get("sample_rows", [])[:3]:
+                        row_str = " | ".join(f"{k}={v[:50]}" for k, v in list(row.items())[:6])
+                        parts.append(f"  {row_str}")
 
         # Add evidence summary from skills
         if evidence and aggregator:
