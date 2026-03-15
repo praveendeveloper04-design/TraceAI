@@ -238,10 +238,37 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
             if profile:
                 profiles.append(profile)
 
-        # Run investigation — the engine handles all internal failures gracefully
+        # Run investigation with state tracking
+        from task_analyzer.core.investigation_state import InvestigationState, investigation_registry
+        import uuid
+
         engine = InvestigationEngine(config=config, registry=registry, profiles=profiles)
-        report = await engine.investigate(task)
+
+        # Pre-create the report ID so we can track it
+        investigation_id = str(uuid.uuid4())
+
+        inv_state = InvestigationState(investigation_id, request.task_id, task.title)
+        investigation_registry.register(inv_state)
+
+        async def _progress(stage: str, message: str) -> None:
+            progress_map = {
+                "loading_ticket": 10, "skills_execution": 30,
+                "evidence_aggregation": 50, "building_graph": 60,
+                "building_context": 70, "ai_reasoning": 85,
+                "generating_report": 95,
+            }
+            inv_state.set_step(stage, progress_map.get(stage, inv_state.progress))
+
+        try:
+            report = await engine.investigate(task, progress_callback=_progress)
+        except asyncio.CancelledError:
+            inv_state.complete("cancelled")
+            return {"id": investigation_id, "status": "cancelled", "task_id": request.task_id}
+
+        # Override the report ID to match our tracked ID
+        report.id = investigation_id
         store.save_investigation(report)
+        inv_state.complete(report.status.value)
 
         logger.info(
             "investigation_api_complete",
@@ -374,6 +401,75 @@ async def get_investigation_markdown(report_id: str) -> dict[str, str]:
     if not report:
         raise HTTPException(status_code=404, detail=f"Investigation '{report_id}' not found")
     return {"markdown": report.to_markdown()}
+
+
+@app.delete("/api/investigations")
+async def delete_all_investigations() -> dict[str, Any]:
+    """Delete all investigation history."""
+    from task_analyzer.storage.local_store import LocalStore
+
+    store = LocalStore()
+    files = list(store.investigations_dir.glob("*.json"))
+    count = 0
+    for f in files:
+        try:
+            f.unlink()
+            count += 1
+        except Exception:
+            pass
+    logger.info("investigations_deleted_all", count=count)
+    return {"success": True, "deleted": count}
+
+
+@app.delete("/api/investigations/{report_id}")
+async def delete_investigation(report_id: str) -> dict[str, Any]:
+    """Delete a single investigation report."""
+    from task_analyzer.storage.local_store import LocalStore
+
+    store = LocalStore()
+    path = store.investigations_dir / f"{report_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Investigation '{report_id}' not found")
+    path.unlink()
+    logger.info("investigation_deleted", id=report_id)
+    return {"success": True}
+
+
+@app.get("/api/investigation/{investigation_id}/status")
+async def get_investigation_status(investigation_id: str) -> dict[str, Any]:
+    """Get live status of a running investigation."""
+    from task_analyzer.core.investigation_state import investigation_registry
+
+    state = investigation_registry.get(investigation_id)
+    if state:
+        return state.to_dict()
+    # Fall back to stored report
+    from task_analyzer.storage.local_store import LocalStore
+    store = LocalStore()
+    report = store.load_investigation(investigation_id)
+    if report:
+        return {
+            "id": report.id,
+            "task_id": report.task_id,
+            "task_title": report.task_title,
+            "status": report.status.value,
+            "step": "done",
+            "progress": 100,
+            "logs": [],
+            "started_at": str(report.started_at),
+            "finished_at": str(report.completed_at),
+        }
+    raise HTTPException(status_code=404, detail="Investigation not found")
+
+
+@app.post("/api/investigation/{investigation_id}/cancel")
+async def cancel_investigation(investigation_id: str) -> dict[str, Any]:
+    """Cancel a running investigation."""
+    from task_analyzer.core.investigation_state import investigation_registry
+
+    if investigation_registry.cancel(investigation_id):
+        return {"success": True, "status": "cancelled"}
+    raise HTTPException(status_code=404, detail="Investigation not found or already completed")
 
 
 @app.get("/api/validate")
