@@ -23,7 +23,14 @@ test/**
 # Documentation (keep README.md for marketplace)
 docs/**
 
-
+# Node dev dependencies (keep production deps like axios)
+node_modules/.package-lock.json
+node_modules/@types/**
+node_modules/@typescript-eslint/**
+node_modules/@vscode/**
+node_modules/eslint/**
+node_modules/typescript/**
+node_modules/.cache/**
 
 # Python bytecode
 **/__pycache__/**
