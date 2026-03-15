@@ -59,6 +59,7 @@ from task_analyzer.skills.ticket_context import TicketContextSkill
 from task_analyzer.skills.cross_repo_analysis import CrossRepoAnalysisSkill
 from task_analyzer.skills.database_schema import DatabaseSchemaSkill
 from task_analyzer.skills.sql_query import SQLQuerySkill
+from task_analyzer.skills.code_analysis import CodeAnalysisSkill
 
 logger = structlog.get_logger(__name__)
 
@@ -66,49 +67,85 @@ logger = structlog.get_logger(__name__)
 # ─── System Prompt ────────────────────────────────────────────────────────────
 
 INVESTIGATION_SYSTEM_PROMPT = """\
-You are an expert software engineer and investigator. Your job is to analyze
-a task (bug, incident, user story, or feature request) and produce a thorough
-investigation report.
+You are an expert software engineer performing a structured investigation.
+Your job is to analyze a task and produce an EVIDENCE-BASED investigation report.
 
-## Your Approach
+## CRITICAL RULES -- READ CAREFULLY
 
-1. **Understand the Task**: Read the task description, comments, and metadata carefully.
-2. **Analyze the Codebase**: Use the project knowledge profile to understand the architecture.
-3. **Use Available Tools**: If tools are available (database queries, documentation search,
-   log retrieval), use them to gather evidence. Only use tools that are relevant.
-4. **Review Skill Findings**: Pre-investigation skills have already gathered evidence.
-   Use their findings to inform your analysis.
-5. **Reason Step by Step**: Think through the problem methodically. Consider multiple hypotheses.
-6. **Produce Findings**: For each finding, state your confidence level and supporting evidence.
+1. **NEVER fabricate evidence.** Only cite evidence that is explicitly provided below.
+   If you did not receive code, logs, or data for something, do NOT claim you found it.
 
-## Output Format
+2. **NEVER invent root causes.** If the evidence is insufficient to determine the
+   root cause, you MUST say: "Insufficient evidence to determine root cause."
+   Do NOT guess or speculate and present it as a finding.
 
-Structure your response as a JSON object with these fields:
+3. **Confidence scores MUST reflect evidence quality:**
+   - 0.9-1.0: You found the EXACT code line or configuration causing the bug
+   - 0.7-0.8: You found the relevant code file and function but not the exact line
+   - 0.5-0.6: You have database/log evidence suggesting a pattern but no code proof
+   - 0.3-0.4: You have architectural knowledge suggesting a likely area but no direct evidence
+   - 0.1-0.2: Pure speculation based on the task description alone
+   NEVER assign confidence above 0.5 without code-level evidence (file path + code snippet).
+
+4. **Separate VERIFIED findings from HYPOTHESES:**
+   - category "verified_finding": backed by code, logs, or data you can cite
+   - category "hypothesis": your best guess based on architecture knowledge
+   - category "insufficient_evidence": areas where more investigation is needed
+
+5. **SQL data is OBSERVATIONAL, not CAUSAL.** Database rows show current state,
+   not why something happened. Do NOT claim a SQL row "proves" a root cause.
+   SQL data can support a hypothesis but cannot confirm it without code evidence.
+
+6. **The ticket description may be inaccurate.** The reporter describes symptoms,
+   not causes. Do NOT assume the reporter's theory is correct.
+
+## EVIDENCE QUALITY GUIDE
+
+The evidence provided below is tagged with its source:
+- [CODE] = from repository source code (highest reliability)
+- [SQL] = from database query results (observational only)
+- [SCHEMA] = from database schema discovery (structural only)
+- [TICKET] = from the ticket system (reporter's perspective, may be inaccurate)
+- [ARCHITECTURE] = from system configuration (infrastructure context)
+
+Base your confidence scores on the HIGHEST quality evidence you have for each finding.
+
+## WHAT TO DO WHEN EVIDENCE IS INSUFFICIENT
+
+If you cannot find the root cause from the provided evidence:
+1. State clearly what evidence is missing
+2. List specific files, logs, or data that would be needed
+3. Provide hypotheses clearly labeled as speculation
+4. Recommend specific next investigation steps
+
+## OUTPUT FORMAT
 
 ```json
 {{
-    "summary": "A 2-3 sentence executive summary of the investigation",
-    "root_cause": "Detailed root cause analysis (if applicable)",
+    "summary": "2-3 sentence summary. State clearly if evidence was sufficient or not.",
+    "root_cause": "Root cause if evidence supports it. Otherwise: 'Insufficient evidence. Hypotheses: ...'",
+    "evidence_quality": "sufficient|partial|insufficient",
     "findings": [
         {{
-            "category": "root_cause|related_code|configuration_issue|dependency_issue|design_flaw|missing_test",
+            "category": "verified_finding|hypothesis|insufficient_evidence|related_code|configuration_issue",
             "title": "Short title",
-            "description": "Detailed description",
+            "description": "Description. For hypotheses, explain what evidence would confirm or deny this.",
             "confidence": 0.0-1.0,
-            "evidence": ["Evidence item 1", "Evidence item 2"],
-            "file_references": ["path/to/file.py"]
+            "evidence": ["[SOURCE] Evidence item with source tag"],
+            "file_references": ["path/to/file.py:line_number"]
         }}
     ],
-    "recommendations": [
-        "Actionable recommendation 1",
-        "Actionable recommendation 2"
+    "missing_evidence": [
+        "Specific file or data that would help: e.g., 'DeleteTrip() method source code'",
+        "Specific log that would help: e.g., 'OVC API call logs for BP tenant'"
     ],
-    "affected_files": ["path/to/file1.py", "path/to/file2.py"],
-    "affected_services": ["service-name-1"]
+    "recommendations": [
+        "Actionable recommendation 1"
+    ],
+    "affected_files": ["path/to/file.py"],
+    "affected_services": ["service-name"]
 }}
 ```
-
-Be thorough but concise. Focus on actionable insights.
 """
 
 
@@ -389,6 +426,7 @@ class InvestigationEngine:
         self.skill_registry.register(DatabaseAnalysisSkill())
         self.skill_registry.register(CrossRepoAnalysisSkill())
         self.skill_registry.register(DatabaseSchemaSkill())
+        self.skill_registry.register(CodeAnalysisSkill())
         self.skill_registry.register(SQLQuerySkill())
 
         # Load workspace profile for cross-repo awareness
@@ -479,14 +517,26 @@ class InvestigationEngine:
             investigation_plan = None
             try:
                 from task_analyzer.investigation.planner import InvestigationPlanner
+
+                # Find SQL connector for schema discovery
+                db_connector_for_planner = None
+                for cname, conn in self.registry.get_all_instances().items():
+                    ct = getattr(conn, "connector_type", None)
+                    if ct and hasattr(ct, "value") and ct.value == "sql_database":
+                        db_connector_for_planner = conn
+                        break
+
                 planner = InvestigationPlanner()
-                investigation_plan = planner.plan(task.title, task.description)
+                investigation_plan = planner.plan(
+                    task.title, task.description,
+                    db_connector=db_connector_for_planner,
+                )
                 logger.info(
                     "investigation_plan_ready",
+                    entities=investigation_plan.entities[:5],
                     systems=investigation_plan.systems,
                     repos=investigation_plan.repos,
                     tables=investigation_plan.tables,
-                    keywords=investigation_plan.matched_keywords,
                 )
 
                 # Load additional repos identified by planner
@@ -515,7 +565,43 @@ class InvestigationEngine:
                 "type": task.task_type.value,
             })
 
-            # Step 2: Run available skills
+            # Step 1b: Run deep investigation (3-loop evidence collection)
+            deep_evidence = None
+            try:
+                from task_analyzer.investigation.deep_investigator import DeepInvestigator
+                await _emit("deep_investigation", "Running deep evidence collection (3 loops)...")
+                report.steps.append(InvestigationStep(
+                    step_number=1,
+                    action="Deep evidence collection",
+                    reasoning="Running 3-loop iterative investigation: broad discovery, targeted deepening, verification",
+                ))
+
+                connectors = self.registry.get_all_instances()
+                deep = DeepInvestigator(
+                    profiles=self.profiles,
+                    connectors=connectors,
+                    plan=investigation_plan,
+                )
+                deep_evidence = await deep.collect(
+                    task.title, task.description,
+                    progress_callback=progress_callback,
+                )
+
+                quality = deep_evidence.get("quality", {})
+                logger.info(
+                    "deep_investigation_complete",
+                    task_id=task.id,
+                    code_files=len(deep_evidence.get("code_files", [])),
+                    sql_tables=len(deep_evidence.get("sql_tables", [])),
+                    code_flows=len(deep_evidence.get("code_flows", [])),
+                    search_results=len(deep_evidence.get("repo_search_results", [])),
+                    quality_score=quality.get("score", 0),
+                    quality_level=quality.get("level", "unknown"),
+                )
+            except Exception as exc:
+                logger.warning("deep_investigation_failed", error=str(exc), error_type=type(exc).__name__)
+
+            # Step 2: Run available skills (for ticket context, cross-repo, etc.)
             await _emit("skills_execution", "Running investigation skills...")
             report.steps.append(InvestigationStep(
                 step_number=1,
@@ -582,6 +668,37 @@ class InvestigationEngine:
                         error_type=type(exc).__name__,
                     )
 
+            # Step 2b: Build SQL queries from best available source
+            # Priority: code-discovered tables that exist in schema > schema-discovered tables
+            if investigation_plan and investigation_plan.tables:
+                # Schema-discovered tables already have queries from the planner
+                # Only override if code analysis found tables that match the schema
+                if "code_analysis" in skill_results:
+                    code_tables = skill_results["code_analysis"].get("code_tables", [])
+                    if code_tables:
+                        try:
+                            from task_analyzer.investigation.planner import SchemaDiscovery
+                            db_conn = None
+                            for cn, co in self.registry.get_all_instances().items():
+                                ct = getattr(co, "connector_type", None)
+                                if ct and hasattr(ct, "value") and ct.value == "sql_database":
+                                    db_conn = co
+                                    break
+                            if db_conn:
+                                sd = SchemaDiscovery()
+                                schema_tables = sd.discover_tables(db_conn, investigation_plan.tenant_db)
+                                # Check which code tables actually exist in schema
+                                schema_simple = {t.split(".")[-1].lower() for t in schema_tables}
+                                valid_code_tables = [t for t in code_tables if t.lower() in schema_simple]
+                                if valid_code_tables:
+                                    investigation_plan.code_tables = valid_code_tables
+                                    investigation_plan.build_queries_from_code_tables(schema_tables)
+                                    logger.info("queries_from_code_tables", tables=valid_code_tables[:5])
+                                else:
+                                    logger.info("code_tables_not_in_schema", code=code_tables[:5], using="schema_discovery")
+                        except Exception as exc:
+                            logger.debug("query_rebuild_failed", error=str(exc))
+
             # Step 3: Aggregate evidence and rank root causes
             await _emit("evidence_aggregation", "Aggregating evidence...")
             report.steps.append(InvestigationStep(
@@ -609,7 +726,8 @@ class InvestigationEngine:
                 reasoning="Gathering task details, project knowledge, skill findings, and connector context",
             ))
             context = await self._build_context(
-                task, evidence, aggregator, graph, skill_results, investigation_plan
+                task, evidence, aggregator, graph, skill_results, investigation_plan,
+                deep_evidence=deep_evidence,
             )
 
             # Step 5: Create tools (only from healthy connectors)
@@ -814,19 +932,34 @@ class InvestigationEngine:
         graph: InvestigationGraph | None = None,
         skill_results: dict | None = None,
         investigation_plan: Any | None = None,
+        deep_evidence: dict | None = None,
     ) -> str:
-        """Assemble the full context for the investigation."""
+        """Assemble the full context with evidence quality tags."""
         parts = [
             "# Task Under Investigation",
-            task.full_context,
+            "[TICKET] " + task.full_context,
         ]
+
+        # Deep investigation evidence (highest priority -- most comprehensive)
+        if deep_evidence:
+            from task_analyzer.investigation.deep_investigator import DeepInvestigator
+            # Build the rich context from deep evidence
+            di = DeepInvestigator([], {})
+            di.evidence = deep_evidence
+            deep_context = di.build_context_for_llm()
+            if deep_context:
+                parts.append(f"\n# Deep Investigation Evidence\n{deep_context}")
+
+        # Evidence quality summary -- tell Claude what it has and doesn't have
+        quality = self._build_evidence_quality_summary(evidence, skill_results, deep_evidence)
+        parts.append(f"\n# Evidence Quality Assessment\n{quality}")
 
         # Add system architecture from system_map.json
         try:
             from task_analyzer.investigation.planner import load_system_map
             system_map = load_system_map()
             if system_map.services:
-                parts.append(f"\n# {system_map.summarize()}")
+                parts.append(f"\n# [ARCHITECTURE] {system_map.summarize()}")
         except Exception:
             pass
 
@@ -834,15 +967,15 @@ class InvestigationEngine:
         if investigation_plan and hasattr(investigation_plan, "summarize"):
             plan_summary = investigation_plan.summarize()
             if plan_summary:
-                parts.append(f"\n# {plan_summary}")
+                parts.append(f"\n# [ARCHITECTURE] {plan_summary}")
 
         # Add workspace architecture (cross-repo awareness)
         if self._workspace_summary:
-            parts.append(f"\n# {self._workspace_summary}")
+            parts.append(f"\n# [ARCHITECTURE] {self._workspace_summary}")
 
         # Add project profiles (including dependent repos)
         if self.profiles:
-            parts.append("\n# Project Knowledge")
+            parts.append("\n# [CODE] Project Knowledge")
             for profile in self.profiles:
                 parts.append(profile.context_summary)
 
@@ -851,22 +984,53 @@ class InvestigationEngine:
             schema = skill_results["database_schema"]
             schema_summary = schema.get("schema_summary", "")
             if schema_summary:
-                parts.append(f"\n# Database Schema\n{schema_summary}")
+                parts.append(f"\n# [SCHEMA] Database Schema\n{schema_summary}")
 
         # Add cross-repo analysis from skill results
         if skill_results and "cross_repo_analysis" in skill_results:
             cross = skill_results["cross_repo_analysis"]
             if cross.get("related_services"):
-                parts.append("\n# Related Services")
+                parts.append("\n# [ARCHITECTURE] Related Services")
                 for svc in cross["related_services"]:
                     parts.append(f"- **{svc['name']}** in {svc.get('repo', '?')} (`{svc.get('path', '?')}`)")
+
+        # Add code analysis results (code flows and table references)
+        if skill_results and "code_analysis" in skill_results:
+            code_data = skill_results["code_analysis"]
+            code_tables = code_data.get("code_tables", [])
+            code_flows = code_data.get("code_flows", [])
+            code_refs = code_data.get("code_references", [])
+
+            if code_tables or code_flows or code_refs:
+                parts.append("\n# [CODE] Code Analysis")
+
+            if code_tables:
+                parts.append(f"\n### Tables Referenced in Code ({len(code_tables)})")
+                for t in code_tables[:15]:
+                    parts.append(f"- {t}")
+
+            if code_flows:
+                parts.append(f"\n### Application Layers Detected")
+                seen_flows = set()
+                for flow in code_flows[:15]:
+                    key = f"{flow['layer']}: {flow['class']}"
+                    if key not in seen_flows:
+                        parts.append(f"- {flow['layer']}: **{flow['class']}** ({flow['file']})")
+                        seen_flows.add(key)
+
+            if code_refs:
+                parts.append(f"\n### Code References ({len(code_refs)})")
+                for ref in code_refs[:10]:
+                    parts.append(f"- `{ref['file']}:{ref['line']}` {ref['context'][:80]}")
 
         # Add SQL query results from SQLQuerySkill
         if skill_results and "sql_query" in skill_results:
             sql_data = skill_results["sql_query"]
             query_results = sql_data.get("query_results", [])
             if query_results:
-                parts.append("\n# SQL Query Results")
+                parts.append("\n# [SQL] Database Query Results")
+                parts.append("NOTE: SQL data shows current state only. It does NOT prove causation.")
+                parts.append("Do NOT claim SQL rows 'prove' a root cause without code-level evidence.")
                 for qr in query_results[:5]:
                     table = qr.get("table", "?")
                     rows = qr.get("row_count", 0)
@@ -909,6 +1073,102 @@ class InvestigationEngine:
                 )
 
         return "\n\n".join(parts)
+
+    def _build_evidence_quality_summary(
+        self, evidence: dict | None, skill_results: dict | None,
+        deep_evidence: dict | None = None,
+    ) -> str:
+        """
+        Build a clear summary of what evidence is available and what is missing.
+        This helps Claude calibrate its confidence appropriately.
+        """
+        lines = []
+
+        # Check deep investigation evidence first (most comprehensive)
+        deep_code = 0
+        deep_sql = 0
+        deep_flows = 0
+        deep_refs = 0
+        if deep_evidence:
+            deep_code = len(deep_evidence.get("code_files", []))
+            deep_sql = len([t for t in deep_evidence.get("sql_tables", []) if t.get("row_count", 0) > 0])
+            deep_flows = len(deep_evidence.get("code_flows", []))
+            deep_refs = len(deep_evidence.get("repo_search_results", []))
+            dq = deep_evidence.get("quality", {})
+            lines.append(f"DEEP INVESTIGATION: {dq.get('level', '?')} ({dq.get('score', 0)}/100)")
+            for d in dq.get("details", []):
+                lines.append(f"  - {d}")
+            lines.append("")
+
+        # Check code evidence (from skills + deep)
+        has_code_files = deep_code > 0
+        has_code_flows = deep_flows > 0
+        has_code_refs = deep_refs > 0
+        if skill_results and "code_analysis" in skill_results:
+            cd = skill_results["code_analysis"]
+            has_code_files = has_code_files or bool(cd.get("relevant_files"))
+            has_code_flows = has_code_flows or bool(cd.get("code_flows"))
+            has_code_refs = has_code_refs or bool(cd.get("code_references"))
+
+        if has_code_refs:
+            lines.append("[CODE] Source code references: AVAILABLE -- you may cite specific files and lines")
+        else:
+            lines.append("[CODE] Source code references: NOT AVAILABLE -- no relevant code files were found")
+            lines.append("  -> Without code evidence, confidence for root cause should be below 0.5")
+
+        if has_code_flows:
+            lines.append("[CODE] Application code flows: AVAILABLE")
+        else:
+            lines.append("[CODE] Application code flows: NOT AVAILABLE -- no Controller/Service/Repository patterns found")
+
+        # Check SQL evidence (from skills + deep)
+        has_sql = deep_sql > 0
+        sql_tables = deep_sql
+        if skill_results and "sql_query" in skill_results:
+            sq = skill_results["sql_query"]
+            sql_tables = len(sq.get("tables_queried", []))
+            has_sql = sql_tables > 0
+
+        if has_sql:
+            lines.append(f"[SQL] Database query results: AVAILABLE ({sql_tables} tables queried)")
+            lines.append("  -> SQL data is OBSERVATIONAL. It shows state, not cause.")
+        else:
+            lines.append("[SQL] Database query results: NOT AVAILABLE")
+
+        # Check schema
+        has_schema = False
+        if skill_results and "database_schema" in skill_results:
+            has_schema = bool(skill_results["database_schema"].get("tables"))
+
+        if has_schema:
+            lines.append("[SCHEMA] Database schema: AVAILABLE")
+        else:
+            lines.append("[SCHEMA] Database schema: NOT AVAILABLE")
+
+        # Check repo evidence
+        has_files = bool(evidence and evidence.get("files"))
+        has_commits = bool(evidence and evidence.get("commits"))
+        has_errors = bool(evidence and evidence.get("errors"))
+
+        if has_files:
+            lines.append(f"[CODE] Repository files: {len(evidence['files'])} relevant files found")
+        if has_commits:
+            lines.append(f"[CODE] Recent commits: {len(evidence['commits'])} commits found")
+        if has_errors:
+            lines.append(f"[SQL] Error patterns: {len(evidence['errors'])} errors found")
+
+        # Overall assessment
+        lines.append("")
+        if has_code_refs and has_sql:
+            lines.append("OVERALL: Code + SQL evidence available. Moderate-to-high confidence findings possible.")
+        elif has_code_refs:
+            lines.append("OVERALL: Code evidence available but no SQL data. Code-based findings possible.")
+        elif has_sql:
+            lines.append("OVERALL: SQL data available but NO code evidence. Findings should be hypotheses only (confidence < 0.5).")
+        else:
+            lines.append("OVERALL: INSUFFICIENT EVIDENCE. No code or SQL data found. Report should state this clearly.")
+
+        return "\n".join(lines)
 
     def _build_tools(self, task: Task) -> list[StructuredTool]:
         """Create LangChain tools from active connectors (skip failed ones)."""
@@ -1022,5 +1282,13 @@ Produce your findings as the JSON structure described in your instructions."""),
                 ))
 
         report.recommendations = result.get("recommendations", [])
+
+        # Add missing evidence as recommendations if present
+        missing = result.get("missing_evidence", [])
+        if missing:
+            report.recommendations.extend(
+                [f"Investigate: {m}" for m in missing[:5]]
+            )
+
         report.affected_files = result.get("affected_files", [])
         report.affected_services = result.get("affected_services", [])

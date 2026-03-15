@@ -15,6 +15,7 @@ from task_analyzer.skills.database_analysis import DatabaseAnalysisSkill
 from task_analyzer.skills.cross_repo_analysis import CrossRepoAnalysisSkill
 from task_analyzer.skills.database_schema import DatabaseSchemaSkill
 from task_analyzer.skills.sql_query import SQLQuerySkill
+from task_analyzer.skills.code_analysis import CodeAnalysisSkill
 
 __all__ = [
     "BaseSkill",
@@ -26,4 +27,5 @@ __all__ = [
     "CrossRepoAnalysisSkill",
     "DatabaseSchemaSkill",
     "SQLQuerySkill",
+    "CodeAnalysisSkill",
 ]

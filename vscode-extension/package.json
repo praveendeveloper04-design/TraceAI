@@ -2,7 +2,7 @@
     "name": "traceai",
     "displayName": "TraceAI",
     "description": "AI-powered developer investigation platform — investigate bugs, incidents, and user stories with Claude",
-    "version": "0.4.0",
+    "version": "1.0.0",
     "publisher": "traceai",
     "engines": {
         "vscode": "^1.85.0"

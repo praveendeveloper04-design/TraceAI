@@ -67,29 +67,60 @@ class DatabaseSchemaSkill(BaseSkill):
                 self._add_to_graph(graph, task.id, result["tables"], db_name)
                 return result
 
-            # Query schema using raw engine access (bypasses SecurityGuard
-            # INFORMATION_SCHEMA block because this is a trusted system skill)
+            # Query schema using raw engine access
             try:
                 engine = db_connector._get_engine()
                 from sqlalchemy import inspect, text
-                inspector = inspect(engine)
+
+                # Determine which database to query from the investigation plan
+                plan = context.get("investigation_plan")
+                tenant_db = None
+                if plan:
+                    tenant_db = plan.tenant_db if hasattr(plan, "tenant_db") else plan.get("tenant_db")
 
                 tables_data = []
-                table_names = inspector.get_table_names()[:50]
 
-                for table_name in table_names:
-                    try:
-                        columns = inspector.get_columns(table_name)
-                        col_info = [
-                            {"name": c["name"], "type": str(c.get("type", ""))}
-                            for c in columns[:20]
-                        ]
-                        tables_data.append({
-                            "name": table_name,
-                            "columns": col_info,
-                        })
-                    except Exception:
-                        tables_data.append({"name": table_name, "columns": []})
+                if tenant_db:
+                    # Query the tenant-specific database
+                    with engine.connect() as conn:
+                        conn.execute(text("SET ROWCOUNT 100"))
+                        result_rows = conn.execute(text(
+                            f"SELECT TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
+                            f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"
+                        ))
+                        table_names = [row[0] for row in result_rows][:50]
+
+                    # Get columns for each table
+                    with engine.connect() as conn:
+                        for table_name in table_names:
+                            try:
+                                col_rows = conn.execute(text(
+                                    f"SELECT COLUMN_NAME, DATA_TYPE FROM {tenant_db}.INFORMATION_SCHEMA.COLUMNS "
+                                    f"WHERE TABLE_NAME = :tbl ORDER BY ORDINAL_POSITION"
+                                ), {"tbl": table_name})
+                                col_info = [
+                                    {"name": row[0], "type": row[1]}
+                                    for row in col_rows
+                                ][:20]
+                                tables_data.append({"name": table_name, "columns": col_info})
+                            except Exception:
+                                tables_data.append({"name": table_name, "columns": []})
+
+                    db_name = tenant_db
+                else:
+                    # Fallback: query current database via inspector
+                    inspector = inspect(engine)
+                    table_names = inspector.get_table_names()[:50]
+                    for table_name in table_names:
+                        try:
+                            columns = inspector.get_columns(table_name)
+                            col_info = [
+                                {"name": c["name"], "type": str(c.get("type", ""))}
+                                for c in columns[:20]
+                            ]
+                            tables_data.append({"name": table_name, "columns": col_info})
+                        except Exception:
+                            tables_data.append({"name": table_name, "columns": []})
 
                 result["tables"] = tables_data
 

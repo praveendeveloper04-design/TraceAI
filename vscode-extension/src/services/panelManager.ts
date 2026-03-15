@@ -46,11 +46,17 @@ export class PanelManager {
 
         panel.onDidDispose(() => {
             this.panels.delete(key);
-            // Also remove by investigation ID if set
             for (const [k, v] of this.panels) {
                 if (v.panel === panel) {
                     this.panels.delete(k);
                 }
+            }
+        });
+
+        // Register message handler once at creation
+        panel.webview.onDidReceiveMessage(async (msg) => {
+            if (msg.command === 'rerun') {
+                vscode.commands.executeCommand('traceai.investigateFromId', msg.taskId);
             }
         });
 
@@ -89,13 +95,6 @@ export class PanelManager {
             }
             entry.panel.title = `Investigation: ${report.task_title?.substring(0, 40) || taskId}`;
             entry.panel.webview.html = this.getReportHtml(report);
-
-            // Wire up message handler for approve/reject
-            entry.panel.webview.onDidReceiveMessage(async (msg) => {
-                if (msg.command === 'rerun') {
-                    vscode.commands.executeCommand('traceai.investigateFromId', msg.taskId);
-                }
-            });
         }
     }
 
@@ -137,78 +136,103 @@ export class PanelManager {
     // ── HTML Generators ──────────────────────────────────────────────────
 
     private getProgressHtml(taskId: string, taskTitle: string): string {
+        const nonce = this.getNonce();
         const stages = [
             'Loading ticket', 'Running skills', 'Aggregating evidence',
             'Building graph', 'Building context', 'AI reasoning', 'Generating report',
         ];
-        const stageItems = stages.map(s =>
-            `<li class="stage pending"><span class="icon">&#9675;</span> ${this.esc(s)}</li>`
-        ).join('');
 
         return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<style>
-body { font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground);
-       background: var(--vscode-editor-background); padding: 32px; max-width: 600px; margin: 0 auto; }
-h1 { font-size: 1.3em; margin-bottom: 4px; }
-.subtitle { opacity: 0.6; font-size: 0.9em; margin-bottom: 24px; }
-.stages { list-style: none; padding: 0; }
-.stage { padding: 8px 12px; margin: 2px 0; border-radius: 6px; display: flex; align-items: center; gap: 10px; }
-.stage.completed { opacity: 0.6; }
-.stage.completed .icon { color: #4caf50; }
-.stage.running { background: rgba(33,150,243,0.08); border-left: 3px solid #2196f3; font-weight: 500; }
-.stage.running .icon { color: #2196f3; }
-.stage.pending { opacity: 0.3; }
-.icon { width: 20px; text-align: center; }
-.spinner { display: inline-block; animation: spin 1s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.log-area { margin-top: 20px; font-size: 0.82em; opacity: 0.7; max-height: 200px; overflow-y: auto; }
-.log-entry { padding: 2px 0; }
-.banner { margin-top: 16px; padding: 10px 14px; border-radius: 6px; display: none; font-weight: 500; }
-.banner.complete { display: block; background: rgba(76,175,80,0.1); color: #4caf50; }
-.banner.error { display: block; background: rgba(244,67,54,0.1); color: #f44336; }
-.banner.cancelled { display: block; background: rgba(255,152,0,0.1); color: #ff9800; }
-</style></head><body>
-<h1>Investigating: ${this.esc(taskTitle)}</h1>
-<div class="subtitle">Task ${this.esc(taskId)} -- Cancel from the notification bar</div>
-<ul class="stages" id="stages">${stageItems}</ul>
-<div class="log-area" id="logs"></div>
-<div class="banner" id="banner"></div>
-<script>
-const vscode = acquireVsCodeApi();
-const stageNames = ${JSON.stringify(stages)};
-window.addEventListener('message', e => {
-    const msg = e.data;
-    if (msg.command === 'updateProgress') {
-        const list = document.getElementById('stages');
-        const stageIdx = ['loading_ticket','skills_execution','evidence_aggregation',
-            'building_graph','building_context','ai_reasoning','generating_report'];
-        const idx = stageIdx.indexOf(msg.stage);
-        if (list && idx >= 0) {
-            list.innerHTML = stageNames.map((s, i) => {
-                let cls = 'pending', icon = '&#9675;';
-                if (i < idx) { cls = 'completed'; icon = '<span style="color:#4caf50">&#10004;</span>'; }
-                else if (i === idx) { cls = 'running'; icon = '<span class="spinner" style="color:#2196f3">&#11044;</span>'; }
-                return '<li class="stage ' + cls + '"><span class="icon">' + icon + '</span> ' + s + '</li>';
-            }).join('');
-        }
-        if (msg.special) {
-            const b = document.getElementById('banner');
-            if (b) { b.className = 'banner ' + msg.special; b.textContent = msg.message; b.style.display = 'block'; }
-        }
-        // Add log entry
-        const logs = document.getElementById('logs');
-        if (logs && msg.message) {
-            const t = new Date().toLocaleTimeString();
-            logs.innerHTML += '<div class="log-entry">[' + t + '] ' + msg.message + '</div>';
-            logs.scrollTop = logs.scrollHeight;
-        }
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <style>
+        body { font-family: var(--vscode-font-family, sans-serif); color: var(--vscode-editor-foreground, #ccc);
+               background: var(--vscode-editor-background, #1e1e1e); padding: 32px; max-width: 600px; margin: 0 auto; }
+        h1 { font-size: 1.3em; margin-bottom: 4px; }
+        .subtitle { opacity: 0.6; font-size: 0.9em; margin-bottom: 24px; }
+        .stages { list-style: none; padding: 0; }
+        .stage { padding: 8px 12px; margin: 2px 0; border-radius: 6px; display: flex; align-items: center; gap: 10px; }
+        .stage.completed { opacity: 0.6; }
+        .stage.running { background: rgba(33,150,243,0.08); border-left: 3px solid #2196f3; font-weight: 500; }
+        .stage.pending { opacity: 0.3; }
+        .icon { width: 20px; text-align: center; }
+        .spinner { display: inline-block; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .banner { margin-top: 16px; padding: 10px 14px; border-radius: 6px; display: none; font-weight: 500; }
+        .banner.show { display: block; }
+        .banner.complete { background: rgba(76,175,80,0.1); color: #4caf50; }
+        .banner.error { background: rgba(244,67,54,0.1); color: #f44336; }
+        .banner.cancelled { background: rgba(255,152,0,0.1); color: #ff9800; }
+        .log-area { margin-top: 20px; font-size: 0.82em; opacity: 0.7; max-height: 200px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+    <h1>Investigating: ${this.esc(taskTitle)}</h1>
+    <div class="subtitle">Task ${this.esc(taskId)}</div>
+    <ul class="stages" id="stageList">
+        ${stages.map(s => `<li class="stage pending"><span class="icon">&#9675;</span> ${s}</li>`).join('\n        ')}
+    </ul>
+    <div class="banner" id="banner"></div>
+    <div class="log-area" id="logs"></div>
+    <script nonce="${nonce}">
+        (function() {
+            var vscode = acquireVsCodeApi();
+            var stageNames = ${JSON.stringify(stages)};
+            var stageKeys = ['loading_ticket','skills_execution','evidence_aggregation',
+                'building_graph','building_context','ai_reasoning','generating_report'];
+
+            window.addEventListener('message', function(e) {
+                var msg = e.data;
+                if (msg.command === 'updateProgress') {
+                    var list = document.getElementById('stageList');
+                    var banner = document.getElementById('banner');
+                    var logs = document.getElementById('logs');
+                    var idx = stageKeys.indexOf(msg.stage);
+
+                    if (list && idx >= 0) {
+                        var html = '';
+                        for (var i = 0; i < stageNames.length; i++) {
+                            var cls = 'pending';
+                            var icon = '&#9675;';
+                            if (i < idx) { cls = 'completed'; icon = '&#10004;'; }
+                            else if (i === idx) { cls = 'running'; icon = '<span class="spinner">&#9679;</span>'; }
+                            html += '<li class="stage ' + cls + '"><span class="icon">' + icon + '</span> ' + stageNames[i] + '</li>';
+                        }
+                        list.innerHTML = html;
+                    }
+
+                    if (msg.special && banner) {
+                        banner.className = 'banner show ' + msg.special;
+                        banner.textContent = msg.message || '';
+                    }
+
+                    if (logs && msg.message) {
+                        var t = new Date().toLocaleTimeString();
+                        logs.innerHTML += '<div>[' + t + '] ' + msg.message + '</div>';
+                        logs.scrollTop = logs.scrollHeight;
+                    }
+                }
+            });
+        })();
+    </script>
+</body>
+</html>`;
     }
-});
-</script></body></html>`;
+
+    private getNonce(): string {
+        let text = '';
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        for (let i = 0; i < 32; i++) {
+            text += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return text;
     }
 
     private getReportHtml(report: InvestigationReport): string {
+        const nonce = this.getNonce();
         const statusColor = report.status === 'completed' ? '#4caf50' : report.status === 'failed' ? '#f44336' : '#ff9800';
 
         const findingsHtml = (report.findings || []).map((f, i) => `
@@ -233,10 +257,14 @@ window.addEventListener('message', e => {
         }).join('');
 
         return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<style>
-body { font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground);
-       background: var(--vscode-editor-background); padding: 24px; max-width: 900px; margin: 0 auto; line-height: 1.6; }
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <style>
+body { font-family: var(--vscode-font-family, sans-serif); color: var(--vscode-editor-foreground, #ccc);
+       background: var(--vscode-editor-background, #1e1e1e); padding: 24px; max-width: 900px; margin: 0 auto; line-height: 1.6; }
 h1 { font-size: 1.4em; } h2 { font-size: 1.15em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 6px; margin-top: 24px; }
 .status-bar { display: flex; gap: 16px; padding: 10px 14px; background: var(--vscode-editorWidget-background);
               border-radius: 6px; margin-bottom: 16px; border-left: 4px solid ${statusColor}; align-items: center; }
@@ -265,11 +293,17 @@ ${findingsHtml ? `<h2>Findings (${report.findings?.length || 0})</h2>${findingsH
 ${recsHtml ? `<h2>Recommendations</h2><ul>${recsHtml}</ul>` : ''}
 ${report.error ? `<h2>Warnings</h2><div class="card" style="border-left:3px solid #ff9800;">${this.esc(report.error)}</div>` : ''}
 
-<button class="btn btn-rerun" onclick="rerun()">Re-run Investigation</button>
+<button class="btn btn-rerun" id="rerunBtn">Re-run Investigation</button>
 
-<script>
-const vscode = acquireVsCodeApi();
-function rerun() { vscode.postMessage({ command: 'rerun', taskId: '${this.esc(report.task_id || '')}' }); }
+<script nonce="${nonce}">
+(function() {
+    var vscode = acquireVsCodeApi();
+    var rawId = '${this.esc(report.task_id || '')}';
+    var taskId = rawId.replace(/^ado-/, '');
+    document.getElementById('rerunBtn').addEventListener('click', function() {
+        vscode.postMessage({ command: 'rerun', taskId: taskId });
+    });
+})();
 </script></body></html>`;
     }
 

@@ -211,11 +211,18 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
     registry = create_default_registry()
     ticket_connector = registry.create(config.ticket_source)
 
-    # Initialize optional connectors — failures are logged, not fatal
+    # Initialize optional connectors -- validate SQL for schema discovery
     for conn_config in config.connectors:
         if conn_config.enabled:
             try:
-                registry.create(conn_config)
+                conn = registry.create(conn_config)
+                # Validate SQL connector so planner can use it for schema discovery
+                if conn_config.connector_type.value == "sql_database":
+                    try:
+                        await conn.validate_connection()
+                        logger.info("sql_connector_validated_for_planner")
+                    except Exception as sql_exc:
+                        logger.warning("sql_connector_validation_failed", error=str(sql_exc)[:100])
             except Exception as exc:
                 logger.warning(
                     "optional_connector_init_failed",

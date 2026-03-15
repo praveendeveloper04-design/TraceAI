@@ -94,7 +94,8 @@ export function activate(context: vscode.ExtensionContext): void {
     // Investigate by ID (for re-run)
     context.subscriptions.push(
         vscode.commands.registerCommand('traceai.investigateFromId', async (taskId: string) => {
-            await investigateTask(taskId, taskId);
+            const cleanId = (taskId || '').replace(/^ado-/, '');
+            await investigateTask(cleanId, cleanId);
         }),
     );
 
@@ -172,7 +173,8 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('traceai.rerunInvestigation', async (item: any) => {
             const inv = item?.investigation || item;
             if (!inv?.task_id) { return; }
-            await investigateTask(inv.task_id, inv.task_title || inv.task_id);
+            const cleanId = inv.task_id.replace(/^ado-/, '');
+            await investigateTask(cleanId, inv.task_title || cleanId);
         }),
     );
 
