@@ -13,7 +13,10 @@ The VS Code extension communicates with this server over HTTP/WebSocket.
 
 from __future__ import annotations
 
+import asyncio
+import json as _json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +64,7 @@ async def _startup_diagnostics():
         logger.info(
             "startup_llm_key_loaded",
             key_length=len(key),
-            key_prefix=key[:8] + "..." if len(key) > 8 else "****",
+            key_prefix=key[:4] + "..." if len(key) > 4 else "****",
             base_url=base_url or "https://api.anthropic.com (default)",
         )
     else:
@@ -263,6 +266,83 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
         await registry.disconnect_all()
 
 
+@app.get("/api/investigate/{task_id}/stream")
+async def investigate_stream(task_id: str):
+    """
+    Stream investigation progress via Server-Sent Events (SSE).
+
+    Emits progress events as the investigation runs, then a final
+    'complete' event with the full report.
+    """
+    from fastapi.responses import StreamingResponse
+    from task_analyzer.connectors import create_default_registry
+    from task_analyzer.investigation.engine import InvestigationEngine
+    from task_analyzer.storage.local_store import LocalStore
+
+    store = LocalStore()
+    config = store.load_config()
+    if not config or not config.ticket_source:
+        async def _error():
+            yield f"event: error\ndata: {_json.dumps({'error': 'No ticket source configured'})}\n\n"
+        return StreamingResponse(_error(), media_type="text/event-stream")
+
+    async def _stream():
+        progress_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _on_progress(stage: str, message: str):
+            event = {
+                "stage": stage,
+                "message": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await progress_queue.put(("progress", event))
+
+        # Run investigation in a background task
+        async def _run():
+            registry = create_default_registry()
+            ticket_connector = registry.create(config.ticket_source)
+            for conn_config in config.connectors:
+                if conn_config.enabled:
+                    try:
+                        registry.create(conn_config)
+                    except Exception:
+                        pass
+            try:
+                await ticket_connector.validate_connection()
+                task = await ticket_connector.get_task_detail(task_id)
+                if not task:
+                    await progress_queue.put(("error", {"error": f"Task '{task_id}' not found"}))
+                    return
+
+                profiles = []
+                for repo_path in config.repositories:
+                    profile = store.load_profile(Path(repo_path).name)
+                    if profile:
+                        profiles.append(profile)
+
+                engine = InvestigationEngine(config=config, registry=registry, profiles=profiles)
+                report = await engine.investigate(task, progress_callback=_on_progress)
+                store.save_investigation(report)
+                await progress_queue.put(("complete", report.model_dump()))
+            except Exception as exc:
+                await progress_queue.put(("error", {"error": str(exc)}))
+            finally:
+                await registry.disconnect_all()
+                await progress_queue.put(("done", None))
+
+        # Start investigation in background
+        asyncio.create_task(_run())
+
+        # Yield SSE events from the queue
+        while True:
+            event_type, data = await progress_queue.get()
+            if event_type == "done":
+                break
+            yield f"event: {event_type}\ndata: {_json.dumps(data, default=str)}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
 @app.get("/api/investigations")
 async def list_investigations(limit: int = 20) -> list[dict[str, Any]]:
     """List recent investigations."""
@@ -295,6 +375,115 @@ async def get_investigation_markdown(report_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail=f"Investigation '{report_id}' not found")
     return {"markdown": report.to_markdown()}
 
+
+@app.get("/api/validate")
+async def validate_system() -> list[dict]:
+    """Run all system validation checks."""
+    from task_analyzer.core.validation import validate_all
+
+    results = await validate_all()
+    return [r.to_dict() for r in results]
+
+
+class GeneratePatchRequest(BaseModel):
+    investigation_id: str
+    workspace_path: str | None = None
+
+
+@app.post("/api/generate-patch")
+async def generate_patch(request: GeneratePatchRequest) -> dict[str, Any]:
+    """
+    Generate a code patch from an investigation report using Claude.
+
+    Returns a patch object with file diffs that can be previewed
+    and applied by the VS Code extension.
+    """
+    from task_analyzer.storage.local_store import LocalStore
+    from task_analyzer.investigation.engine import _create_llm, _sync_anthropic_env_vars
+    from task_analyzer.models.schemas import PlatformConfig
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    store = LocalStore()
+    report = store.load_investigation(request.investigation_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+
+    config = store.load_config() or PlatformConfig()
+
+    # Build the patch generation prompt from the investigation report
+    prompt_parts = [
+        f"# Investigation Report: {report.task_title}",
+        f"\n## Summary\n{report.summary}",
+    ]
+    if report.root_cause:
+        prompt_parts.append(f"\n## Root Cause\n{report.root_cause}")
+    if report.recommendations:
+        prompt_parts.append("\n## Recommendations")
+        for r in report.recommendations:
+            prompt_parts.append(f"- {r}")
+    if report.affected_files:
+        prompt_parts.append("\n## Affected Files")
+        for f in report.affected_files:
+            prompt_parts.append(f"- {f}")
+
+    context = "\n".join(prompt_parts)
+
+    try:
+        _sync_anthropic_env_vars()
+        llm = _create_llm(config)
+
+        messages = [
+            SystemMessage(content=(
+                "You are a senior software engineer. Based on the investigation report below, "
+                "generate a minimal code patch to fix the identified issue.\n\n"
+                "Output format: a JSON object with this structure:\n"
+                '{"files": [{"path": "relative/path/to/file.py", '
+                '"description": "What this change does", '
+                '"original": "exact lines to replace", '
+                '"patched": "replacement lines"}]}\n\n'
+                "Rules:\n"
+                "- Only modify the minimum lines necessary\n"
+                "- Include enough context in 'original' to uniquely identify the location\n"
+                "- Do not modify unrelated code\n"
+                "- If you cannot determine the exact fix, return an empty files array\n"
+            )),
+            HumanMessage(content=f"Generate a patch for this investigation:\n\n{context}"),
+        ]
+
+        response = await llm.ainvoke(messages)
+        content = response.content if hasattr(response, "content") else str(response)
+
+        # Parse the patch JSON
+        import json as _json
+        patch_data = {"files": [], "raw_response": content}
+        try:
+            if "```json" in content:
+                start = content.index("```json") + 7
+                end = content.index("```", start)
+                patch_data = _json.loads(content[start:end].strip())
+            elif "```" in content:
+                start = content.index("```") + 3
+                end = content.index("```", start)
+                patch_data = _json.loads(content[start:end].strip())
+            else:
+                patch_data = _json.loads(content)
+        except (_json.JSONDecodeError, ValueError):
+            patch_data["parse_error"] = "Could not parse patch JSON from LLM response"
+
+        patch_data["investigation_id"] = request.investigation_id
+        patch_data["task_title"] = report.task_title
+
+        logger.info(
+            "patch_generated",
+            investigation_id=request.investigation_id,
+            file_count=len(patch_data.get("files", [])),
+        )
+
+        return patch_data
+
+    except Exception as exc:
+        logger.error("patch_generation_failed", error=str(exc), error_type=type(exc).__name__)
+        raise HTTPException(status_code=500, detail=f"Patch generation failed: {exc}")
 
 @app.get("/api/profiles")
 async def list_profiles() -> list[dict[str, Any]]:
