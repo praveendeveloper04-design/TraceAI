@@ -56,6 +56,8 @@ from task_analyzer.skills.log_analysis import LogAnalysisSkill
 from task_analyzer.skills.repo_analysis import RepoAnalysisSkill
 from task_analyzer.skills.skill_registry import SkillRegistry
 from task_analyzer.skills.ticket_context import TicketContextSkill
+from task_analyzer.skills.cross_repo_analysis import CrossRepoAnalysisSkill
+from task_analyzer.skills.database_schema import DatabaseSchemaSkill
 
 logger = structlog.get_logger(__name__)
 
@@ -384,6 +386,39 @@ class InvestigationEngine:
         self.skill_registry.register(TicketContextSkill())
         self.skill_registry.register(LogAnalysisSkill())
         self.skill_registry.register(DatabaseAnalysisSkill())
+        self.skill_registry.register(CrossRepoAnalysisSkill())
+        self.skill_registry.register(DatabaseSchemaSkill())
+
+        # Load workspace profile for cross-repo awareness
+        self._workspace_summary = ""
+        try:
+            from task_analyzer.knowledge.workspace_scanner import (
+                WorkspaceScanner, load_workspace_profile,
+            )
+            from task_analyzer.storage.local_store import LocalStore
+
+            workspace = load_workspace_profile()
+            if workspace.repos:
+                scanner = WorkspaceScanner(workspace)
+                store = LocalStore()
+
+                # Load dependent repo profiles
+                for profile in self.profiles:
+                    dep_profiles = scanner.get_dependency_profiles(
+                        profile.repo_name, store
+                    )
+                    for dp in dep_profiles:
+                        if dp not in self.profiles:
+                            self.profiles.append(dp)
+
+                self._workspace_summary = scanner.summarize()
+                logger.info(
+                    "workspace_loaded",
+                    repos=len(workspace.repos),
+                    profiles=len(self.profiles),
+                )
+        except Exception as exc:
+            logger.debug("workspace_load_skipped", error=str(exc))
 
     def _validate_connectors(self) -> None:
         """
@@ -537,7 +572,9 @@ class InvestigationEngine:
                 action="Building investigation context",
                 reasoning="Gathering task details, project knowledge, skill findings, and connector context",
             ))
-            context = await self._build_context(task, evidence, aggregator)
+            context = await self._build_context(
+                task, evidence, aggregator, graph, skill_results
+            )
 
             # Step 5: Create tools (only from healthy connectors)
             tools = self._build_tools(task)
@@ -738,6 +775,8 @@ class InvestigationEngine:
         task: Task,
         evidence: dict | None = None,
         aggregator: EvidenceAggregator | None = None,
+        graph: InvestigationGraph | None = None,
+        skill_results: dict | None = None,
     ) -> str:
         """Assemble the full context for the investigation."""
         parts = [
@@ -745,17 +784,42 @@ class InvestigationEngine:
             task.full_context,
         ]
 
-        # Add project profiles
+        # Add workspace architecture (cross-repo awareness)
+        if self._workspace_summary:
+            parts.append(f"\n# {self._workspace_summary}")
+
+        # Add project profiles (including dependent repos)
         if self.profiles:
             parts.append("\n# Project Knowledge")
             for profile in self.profiles:
                 parts.append(profile.context_summary)
+
+        # Add database schema from skill results
+        if skill_results and "database_schema" in skill_results:
+            schema = skill_results["database_schema"]
+            schema_summary = schema.get("schema_summary", "")
+            if schema_summary:
+                parts.append(f"\n# Database Schema\n{schema_summary}")
+
+        # Add cross-repo analysis from skill results
+        if skill_results and "cross_repo_analysis" in skill_results:
+            cross = skill_results["cross_repo_analysis"]
+            if cross.get("related_services"):
+                parts.append("\n# Related Services")
+                for svc in cross["related_services"]:
+                    parts.append(f"- **{svc['name']}** in {svc.get('repo', '?')} (`{svc.get('path', '?')}`)")
 
         # Add evidence summary from skills
         if evidence and aggregator:
             evidence_text = aggregator.summarize(evidence)
             if evidence_text:
                 parts.append(f"\n# Pre-Investigation Evidence\n{evidence_text}")
+
+        # Add investigation graph summary
+        if graph and len(graph.nodes) > 1:
+            graph_summary = graph.summarize()
+            if graph_summary:
+                parts.append(f"\n# {graph_summary}")
 
         # Add connector context — each connector is isolated
         for name, connector in self.registry.get_all_instances().items():
