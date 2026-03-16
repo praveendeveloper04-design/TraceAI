@@ -469,6 +469,25 @@ class InvestigationEngine:
                     profiles=len(self.profiles),
                 )
 
+                # Telemetry: log workspace architecture
+                self.audit.log_workspace_loaded(
+                    task_id="engine_init",
+                    repositories=[r.get("name", "?") for r in workspace.repos],
+                    dependencies=workspace.dependencies,
+                    services=list(workspace.services.keys()),
+                )
+
+                # Telemetry: log dependency resolution
+                for profile in self.profiles:
+                    dep_names = workspace.get_dependencies(profile.repo_name)
+                    if dep_names:
+                        self.audit.log_dependency_resolution(
+                            task_id="engine_init",
+                            primary_repo=profile.repo_name,
+                            loaded_repos=dep_names,
+                            profiles_count=len(self.profiles),
+                        )
+
                 # Initialize workspace intelligence index
                 try:
                     from task_analyzer.workspace_intelligence.index import WorkspaceIndex
@@ -591,6 +610,14 @@ class InvestigationEngine:
                     strategy=classification.investigation_strategy,
                     complexity=classification.complexity,
                 )
+                self.audit.log_task_classified(
+                    task.id,
+                    category=classification.category,
+                    strategy=classification.investigation_strategy,
+                    complexity=classification.complexity,
+                    confidence=classification.confidence,
+                    signals=classification.signals[:5],
+                )
             except Exception as exc:
                 logger.debug("classification_skipped", error=str(exc))
 
@@ -622,6 +649,15 @@ class InvestigationEngine:
                     repos=investigation_plan.repos,
                     tables=investigation_plan.tables,
                 )
+
+                # Telemetry: log ranked table selection
+                table_ranks = getattr(investigation_plan, "table_ranks", {})
+                if table_ranks:
+                    self.audit.log_tables_ranked(
+                        task.id,
+                        tables=[{"table": t, "rank": table_ranks.get(t, 4)} for t in investigation_plan.tables[:12]],
+                        total_schema_tables=len(self.schema_discovery_cache) if hasattr(self, "schema_discovery_cache") else 0,
+                    )
 
                 # Configure SQL intelligence with tenant DB
                 if investigation_plan.tenant_db:
@@ -740,6 +776,22 @@ class InvestigationEngine:
                 parallel.add_task(
                     f"skill_{skill.name}", _run_skill,
                     timeout=30, priority=5,
+                )
+
+            # Telemetry: log skill selection decision
+            selected_skills = []
+            skipped_skills = []
+            for skill in available_skills:
+                if suggested_skill_names and skill.name not in suggested_skill_names:
+                    skipped_skills.append(skill.name)
+                else:
+                    selected_skills.append(skill.name)
+            if suggested_skill_names:
+                self.audit.log_skills_selected(
+                    task.id,
+                    selected=selected_skills,
+                    skipped=skipped_skills,
+                    reason=f"classification={classification.category}" if classification else "no_classification",
                 )
 
             # Execute all tasks in parallel
@@ -1109,6 +1161,11 @@ class InvestigationEngine:
             "[TICKET] " + task.full_context,
         ]
 
+        # ── [WORKSPACE_ARCHITECTURE] — workspace topology for Claude ─────
+        ws_arch = self._build_workspace_architecture(investigation_plan)
+        if ws_arch:
+            parts.append(f"\n# [WORKSPACE_ARCHITECTURE]\n{ws_arch}")
+
         # Task classification context
         if classification:
             parts.append(f"\n# Task Classification")
@@ -1291,6 +1348,88 @@ class InvestigationEngine:
                 )
 
         return "\n\n".join(parts)
+
+    def _build_workspace_architecture(self, investigation_plan: Any | None = None) -> str:
+        """
+        Build the [WORKSPACE_ARCHITECTURE] context section.
+
+        Summarizes:
+          - Repositories in the workspace
+          - Repository dependency graph
+          - Known services from workspace_profile.json
+          - Database topology from system_map.json
+          - Workspace index statistics (if available)
+        """
+        sections = []
+
+        # Repositories
+        try:
+            from task_analyzer.knowledge.workspace_scanner import load_workspace_profile
+            workspace = load_workspace_profile()
+
+            if workspace.repos:
+                sections.append("## Repositories")
+                for r in workspace.repos:
+                    sections.append(f"- {r.get('name', '?')} (`{r.get('path', '?')}`)")
+
+                # Dependency graph
+                if workspace.dependencies:
+                    sections.append("\n## Dependency Graph")
+                    for repo, deps in workspace.dependencies.items():
+                        for dep in deps:
+                            sections.append(f"- {repo} -> {dep}")
+
+                # Services
+                if workspace.services:
+                    sections.append("\n## Services")
+                    for svc_name, svc_info in workspace.services.items():
+                        repo = svc_info.get("repo", "?")
+                        path = svc_info.get("path", "?")
+                        sections.append(f"- {svc_name} located in {repo} repository (`{path}`)")
+        except Exception:
+            pass
+
+        # Database topology from system_map
+        try:
+            from task_analyzer.investigation.planner import load_system_map
+            smap = load_system_map()
+
+            if smap.flows:
+                sections.append("\n## Data Flows")
+                for flow_name, systems in smap.flows.items():
+                    sections.append(f"- {flow_name}: {' -> '.join(systems)}")
+
+            if smap.tenant_db_map:
+                sections.append("\n## Database Topology")
+                for tenant, db in smap.tenant_db_map.items():
+                    sections.append(f"- Tenant '{tenant}' -> database {db}")
+
+            if investigation_plan and investigation_plan.tenant:
+                sections.append(f"\n## Active Tenant: {investigation_plan.tenant} (database: {investigation_plan.tenant_db})")
+        except Exception:
+            pass
+
+        # Workspace index statistics
+        if self._workspace_index:
+            try:
+                stats = self._workspace_index.get_stats()
+                sections.append("\n## Workspace Index")
+                sections.append(
+                    f"- {stats['repositories']} repositories indexed, "
+                    f"{stats['classes']} classes, {stats['methods']} methods"
+                )
+                sections.append(
+                    f"- {stats['api_routes']} API routes, "
+                    f"{stats['class_table_refs']} code-to-table references"
+                )
+                sections.append(
+                    f"- {stats['db_tables']} database tables, "
+                    f"{stats['foreign_keys']} foreign key relationships"
+                )
+            except Exception:
+                pass
+
+        return "\n".join(sections) if sections else ""
 
     def _build_evidence_quality_summary(
         self, evidence: dict | None, skill_results: dict | None,

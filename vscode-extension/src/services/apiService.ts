@@ -142,7 +142,7 @@ export class ApiService {
      */
     async investigateWithProgress(
         taskId: string,
-        onProgress: (stage: string, message: string) => void,
+        onProgress: (stage: string, message: string, percentage: number) => void,
         onComplete: (report: InvestigationReport) => void,
         onError: (error: string) => void,
     ): Promise<void> {
@@ -152,7 +152,7 @@ export class ApiService {
         try {
             const resp = await this.client.get(`/api/investigate/${taskId}/stream`, {
                 responseType: 'text',
-                timeout: 300000, // 5 minutes for long investigations
+                timeout: 600000, // 10 minutes for long investigations
                 // Axios doesn't natively support SSE, so we parse the full response
             });
 
@@ -171,7 +171,11 @@ export class ApiService {
                     if (currentEvent === 'progress') {
                         try {
                             const parsed = JSON.parse(currentData);
-                            onProgress(parsed.stage || '', parsed.message || '');
+                            onProgress(
+                                parsed.stage || '',
+                                parsed.message || '',
+                                parsed.progress || 50,
+                            );
                         } catch { /* skip malformed */ }
                     } else if (currentEvent === 'complete') {
                         try {

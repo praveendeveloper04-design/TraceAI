@@ -301,24 +301,15 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
                 try {
                     // Use SSE streaming for real progress, with fallback to blocking POST
                     await new Promise<void>((resolve, reject) => {
+                        let lastPct = 0;
                         apiService.investigateWithProgress(
                             taskId,
-                            // onProgress — real backend progress events
-                            (stage: string, message: string) => {
+                            // onProgress — real backend progress events with percentage
+                            (stage: string, message: string, percentage: number) => {
                                 if (cancelled) { return; }
-                                const progressMap: Record<string, number> = {
-                                    'loading_ticket': 5, 'classifying': 8,
-                                    'initializing_workspace': 10,
-                                    'parallel_analysis': 15, 'parallel_execution': 20,
-                                    'deep_investigation': 35, 'sql_intelligence': 50,
-                                    'sql_queries': 50,
-                                    'evidence_aggregation': 60, 'building_graph': 65,
-                                    'graph_build': 65,
-                                    'building_context': 70, 'ai_reasoning': 80,
-                                    'generating_report': 90, 'report_generation': 90,
-                                };
-                                const pct = progressMap[stage] || 50;
-                                progress.report({ message, increment: 5 });
+                                const increment = Math.max(0, percentage - lastPct);
+                                lastPct = percentage;
+                                progress.report({ message: `[${percentage}%] ${message}`, increment });
                                 panelManager.updateProgress(taskId, stage, message);
                             },
                             // onComplete — final report received

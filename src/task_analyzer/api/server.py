@@ -326,10 +326,30 @@ async def investigate_stream(task_id: str):
     async def _stream():
         progress_queue: asyncio.Queue = asyncio.Queue()
 
+        # Progress percentage map for each stage
+        PROGRESS_MAP = {
+            "loading_ticket": 5,
+            "classifying": 8,
+            "initializing_workspace": 10,
+            "parallel_analysis": 15,
+            "parallel_execution": 20,
+            "deep_investigation": 35,
+            "sql_intelligence": 50,
+            "sql_queries": 50,
+            "evidence_aggregation": 60,
+            "building_graph": 65,
+            "graph_build": 65,
+            "building_context": 70,
+            "ai_reasoning": 80,
+            "generating_report": 90,
+            "report_generation": 90,
+        }
+
         async def _on_progress(stage: str, message: str):
             event = {
                 "stage": stage,
                 "message": message,
+                "progress": PROGRESS_MAP.get(stage, 50),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             await progress_queue.put(("progress", event))
