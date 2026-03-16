@@ -88,7 +88,7 @@ export class ApiService {
     constructor(port: number = 7420) {
         this.client = axios.create({
             baseURL: `http://127.0.0.1:${port}`,
-            timeout: 120000, // 2 minutes for investigations
+            timeout: 30000, // 30 seconds default for quick calls
             headers: { 'Content-Type': 'application/json' },
         });
     }
@@ -130,7 +130,9 @@ export class ApiService {
     }
 
     async investigate(taskId: string): Promise<InvestigationReport> {
-        const resp = await this.client.post('/api/investigate', { task_id: taskId });
+        const resp = await this.client.post('/api/investigate', { task_id: taskId }, {
+            timeout: 600000, // 10 minutes — investigations involve multi-layer analysis + LLM reasoning
+        });
         return resp.data;
     }
 
