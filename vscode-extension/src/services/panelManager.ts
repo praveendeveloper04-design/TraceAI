@@ -156,6 +156,7 @@ export class PanelManager {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script nonce="${nonce}">if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject()};}</script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
     <style>
@@ -270,6 +271,7 @@ export class PanelManager {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script nonce="${nonce}">if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject()};}</script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
     <style>

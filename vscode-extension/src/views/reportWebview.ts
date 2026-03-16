@@ -119,6 +119,7 @@ export class ReportWebview {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject()};}</script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'none';">
     <title>Investigation Progress</title>
@@ -408,6 +409,7 @@ export class ReportWebview {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject()};}</script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'none';">
     <title>Investigation Report</title>
