@@ -28,6 +28,7 @@ import asyncio
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -42,6 +43,10 @@ from task_analyzer.core.security_guard import SecurityGuard
 from task_analyzer.investigation.evidence_aggregator import EvidenceAggregator
 from task_analyzer.investigation.graph_engine import GraphBuilder, InvestigationGraph, NodeType
 from task_analyzer.investigation.root_cause_engine import RootCauseEngine
+from task_analyzer.investigation.task_classifier import TaskClassifier, TaskClassification
+from task_analyzer.investigation.code_flow_engine import CodeFlowAnalysisEngine, LayerMap
+from task_analyzer.investigation.sql_intelligence import SQLIntelligence, SQLIntelligenceResult
+from task_analyzer.investigation.parallel_engine import ParallelAnalysisEngine, AnalysisResult
 from task_analyzer.models.schemas import (
     InvestigationFinding,
     InvestigationReport,
@@ -418,6 +423,11 @@ class InvestigationEngine:
         self._failed_connectors: list[str] = []
         self._validate_connectors()
 
+        # Initialize new analysis engines
+        self.task_classifier = TaskClassifier()
+        self.code_flow_engine = CodeFlowAnalysisEngine()
+        self.sql_intelligence = SQLIntelligence()
+
         # Initialize skill registry
         self.skill_registry = SkillRegistry()
         self.skill_registry.register(RepoAnalysisSkill())
@@ -513,7 +523,30 @@ class InvestigationEngine:
         await _emit("loading_ticket", "Loading ticket details...")
 
         try:
-            # Step 0: Run investigation planner
+            # Step 0: Classify the task
+            classification = None
+            try:
+                classification = self.task_classifier.classify(
+                    task.title, task.description,
+                    task_type=task.task_type.value if task.task_type else "",
+                )
+                await _emit("classifying", f"Task classified: {classification.category} ({classification.investigation_strategy})")
+                report.steps.append(InvestigationStep(
+                    step_number=0,
+                    action="Task classification",
+                    reasoning=classification.summarize(),
+                ))
+                logger.info(
+                    "task_classified",
+                    task_id=task.id,
+                    category=classification.category,
+                    strategy=classification.investigation_strategy,
+                    complexity=classification.complexity,
+                )
+            except Exception as exc:
+                logger.debug("classification_skipped", error=str(exc))
+
+            # Step 0b: Run investigation planner
             investigation_plan = None
             try:
                 from task_analyzer.investigation.planner import InvestigationPlanner
@@ -538,6 +571,10 @@ class InvestigationEngine:
                     repos=investigation_plan.repos,
                     tables=investigation_plan.tables,
                 )
+
+                # Configure SQL intelligence with tenant DB
+                if investigation_plan.tenant_db:
+                    self.sql_intelligence = SQLIntelligence(tenant_db=investigation_plan.tenant_db)
 
                 # Load additional repos identified by planner
                 if investigation_plan.repos:
@@ -565,114 +602,154 @@ class InvestigationEngine:
                 "type": task.task_type.value,
             })
 
-            # Step 1b: Run deep investigation (3-loop evidence collection)
-            deep_evidence = None
-            try:
-                from task_analyzer.investigation.deep_investigator import DeepInvestigator
-                await _emit("deep_investigation", "Running deep evidence collection (3 loops)...")
-                report.steps.append(InvestigationStep(
-                    step_number=1,
-                    action="Deep evidence collection",
-                    reasoning="Running 3-loop iterative investigation: broad discovery, targeted deepening, verification",
-                ))
+            # Step 1b: Run parallel analysis (code flow + deep investigation + skills)
+            await _emit("parallel_analysis", "Running multi-layer parallel analysis...")
+            report.steps.append(InvestigationStep(
+                step_number=1,
+                action="Multi-layer parallel analysis",
+                reasoning="Running code flow analysis, deep investigation, and skills concurrently",
+            ))
 
-                connectors = self.registry.get_all_instances()
+            parallel = ParallelAnalysisEngine()
+            parallel.set_progress_callback(progress_callback)
+
+            # Get repo paths for code flow analysis
+            repo_paths = []
+            for p in self.profiles:
+                rp = getattr(p, "repo_path", None)
+                if rp and Path(rp).exists():
+                    repo_paths.append(Path(rp))
+
+            # Get entities for analysis
+            entities = []
+            if investigation_plan:
+                entities = investigation_plan.entities
+            elif classification:
+                entities = classification.priority_entities
+
+            # Task A: Code flow analysis (CPU-bound, runs in thread pool)
+            if repo_paths and entities:
+                async def _run_code_flow():
+                    return self.code_flow_engine.analyze(entities, repo_paths)
+                parallel.add_task(
+                    "code_flow_analysis", _run_code_flow,
+                    timeout=30, priority=1,
+                )
+
+            # Task B: Deep investigation (I/O-bound, async)
+            connectors = self.registry.get_all_instances()
+            async def _run_deep_investigation():
+                from task_analyzer.investigation.deep_investigator import DeepInvestigator
                 deep = DeepInvestigator(
                     profiles=self.profiles,
                     connectors=connectors,
                     plan=investigation_plan,
                 )
-                deep_evidence = await deep.collect(
+                return await deep.collect(
                     task.title, task.description,
                     progress_callback=progress_callback,
                 )
+            parallel.add_task(
+                "deep_investigation", _run_deep_investigation,
+                timeout=60, priority=2,
+            )
 
-                quality = deep_evidence.get("quality", {})
-                logger.info(
-                    "deep_investigation_complete",
-                    task_id=task.id,
-                    code_files=len(deep_evidence.get("code_files", [])),
-                    sql_tables=len(deep_evidence.get("sql_tables", [])),
-                    code_flows=len(deep_evidence.get("code_flows", [])),
-                    search_results=len(deep_evidence.get("repo_search_results", [])),
-                    quality_score=quality.get("score", 0),
-                    quality_level=quality.get("level", "unknown"),
-                )
-            except Exception as exc:
-                logger.warning("deep_investigation_failed", error=str(exc), error_type=type(exc).__name__)
-
-            # Step 2: Run available skills (for ticket context, cross-repo, etc.)
-            await _emit("skills_execution", "Running investigation skills...")
-            report.steps.append(InvestigationStep(
-                step_number=1,
-                action="Running investigation skills",
-                reasoning="Executing available skills to gather evidence before AI reasoning",
-            ))
-
-            connectors = self.registry.get_all_instances()
+            # Task C: Run available skills in parallel
             available_skills = self.skill_registry.list_available(connectors)
-            skill_results: dict[str, Any] = {}
-            skill_errors: list[str] = []
-
             skill_context = {"profiles": self.profiles}
             if investigation_plan:
                 skill_context["investigation_plan"] = investigation_plan
 
             for skill in available_skills:
-                skill_start = time.time()
+                async def _run_skill(s=skill):
+                    return await s.run(task, skill_context, self.guard, connectors, graph)
+                parallel.add_task(
+                    f"skill_{skill.name}", _run_skill,
+                    timeout=30, priority=5,
+                )
+
+            # Execute all tasks in parallel
+            analysis_result = await parallel.execute()
+
+            # Extract results
+            deep_evidence = analysis_result.deep_evidence
+            layer_map = analysis_result.layer_map
+            skill_results = analysis_result.skill_results
+
+            # Log parallel execution metrics
+            metrics = analysis_result.export_metrics()
+            logger.info(
+                "parallel_analysis_complete",
+                task_id=task.id,
+                total_ms=metrics["total_duration_ms"],
+                completed=metrics["completed"],
+                failed=metrics["failed"],
+                has_layer_map=metrics["has_layer_map"],
+                has_deep_evidence=metrics["has_deep_evidence"],
+            )
+
+            report.steps.append(InvestigationStep(
+                step_number=2,
+                action="Parallel analysis completed",
+                reasoning=(
+                    f"Completed {metrics['completed']} tasks, "
+                    f"{metrics['failed']} failed, "
+                    f"total {metrics['total_duration_ms']}ms"
+                ),
+            ))
+
+            # Step 2: SQL Intelligence — generate and execute smart queries
+            sql_results = []
+            if investigation_plan and investigation_plan.tables:
+                await _emit("sql_intelligence", "Running SQL intelligence...")
                 try:
-                    result = await asyncio.wait_for(
-                        skill.run(
-                            task, skill_context, self.guard, connectors, graph
-                        ),
-                        timeout=30,
-                    )
-                    skill_results[skill.name] = result
-                    skill_elapsed = int((time.time() - skill_start) * 1000)
-                    self.audit.log_skill_execution(
-                        task.id, skill.name, "success",
-                        duration_ms=skill_elapsed,
-                        findings_count=len(result) if isinstance(result, dict) else 0,
-                    )
-                    logger.info(
-                        "skill_completed",
-                        skill=skill.name,
-                        task_id=task.id,
-                        duration_ms=skill_elapsed,
-                    )
-                except asyncio.TimeoutError:
-                    skill_elapsed = int((time.time() - skill_start) * 1000)
-                    self.audit.log_skill_execution(
-                        task.id, skill.name, "timeout",
-                        duration_ms=skill_elapsed,
-                    )
-                    skill_errors.append(f"{skill.display_name}: timed out after 30s")
-                    logger.warning(
-                        "skill_execution_timeout",
-                        skill=skill.name,
-                        task_id=task.id,
-                        timeout_s=30,
-                    )
-                except Exception as exc:
-                    skill_elapsed = int((time.time() - skill_start) * 1000)
-                    self.audit.log_skill_execution(
-                        task.id, skill.name, "failed",
-                        duration_ms=skill_elapsed,
-                    )
-                    skill_errors.append(f"{skill.display_name}: {type(exc).__name__}: {exc}")
-                    logger.warning(
-                        "skill_execution_failed",
-                        skill=skill.name,
-                        task_id=task.id,
-                        error=str(exc),
-                        error_type=type(exc).__name__,
+                    # Get schema info from deep evidence or skill results
+                    schema_info = {}
+                    if deep_evidence and deep_evidence.get("sql_schema"):
+                        for s in deep_evidence["sql_schema"]:
+                            schema_info[s["table"]] = s.get("columns", [])
+                    if "database_schema" in skill_results:
+                        for t_info in skill_results["database_schema"].get("tables", []):
+                            if t_info.get("name") and t_info.get("columns"):
+                                schema_info[t_info["name"]] = t_info["columns"]
+
+                    # Get code-discovered tables from layer map
+                    code_tables = []
+                    if layer_map:
+                        code_tables = layer_map.db_tables_referenced
+
+                    # Generate smart queries
+                    queries = self.sql_intelligence.generate_queries(
+                        tables=investigation_plan.tables,
+                        schema_info=schema_info,
+                        task_category=classification.category if classification else "unknown",
+                        entities=entities,
+                        code_tables=code_tables,
                     )
 
-            # Step 2b: Build SQL queries from best available source
-            # Priority: code-discovered tables that exist in schema > schema-discovered tables
+                    # Execute queries
+                    db_connector = None
+                    for cn, co in connectors.items():
+                        ct = getattr(co, "connector_type", None)
+                        if ct and hasattr(ct, "value") and ct.value == "sql_database":
+                            db_connector = co
+                            break
+
+                    if db_connector and queries:
+                        sql_results = self.sql_intelligence.execute_queries(
+                            db_connector, queries, max_queries=12,
+                        )
+                        logger.info(
+                            "sql_intelligence_complete",
+                            queries_generated=len(queries),
+                            queries_executed=len(sql_results),
+                        )
+
+                except Exception as exc:
+                    logger.warning("sql_intelligence_failed", error=str(exc)[:200])
+
+            # Step 2b: Build SQL queries from code-discovered tables (fallback)
             if investigation_plan and investigation_plan.tables:
-                # Schema-discovered tables already have queries from the planner
-                # Only override if code analysis found tables that match the schema
                 if "code_analysis" in skill_results:
                     code_tables = skill_results["code_analysis"].get("code_tables", [])
                     if code_tables:
@@ -687,25 +764,28 @@ class InvestigationEngine:
                             if db_conn:
                                 sd = SchemaDiscovery()
                                 schema_tables = sd.discover_tables(db_conn, investigation_plan.tenant_db)
-                                # Check which code tables actually exist in schema
                                 schema_simple = {t.split(".")[-1].lower() for t in schema_tables}
                                 valid_code_tables = [t for t in code_tables if t.lower() in schema_simple]
                                 if valid_code_tables:
                                     investigation_plan.code_tables = valid_code_tables
                                     investigation_plan.build_queries_from_code_tables(schema_tables)
                                     logger.info("queries_from_code_tables", tables=valid_code_tables[:5])
-                                else:
-                                    logger.info("code_tables_not_in_schema", code=code_tables[:5], using="schema_discovery")
                         except Exception as exc:
                             logger.debug("query_rebuild_failed", error=str(exc))
 
             # Step 3: Aggregate evidence and rank root causes
             await _emit("evidence_aggregation", "Aggregating evidence...")
             report.steps.append(InvestigationStep(
-                step_number=2,
+                step_number=3,
                 action="Aggregating evidence and ranking root causes",
                 reasoning="Consolidating skill findings into unified evidence structure",
             ))
+
+            # Collect skill errors from parallel execution
+            skill_errors: list[str] = []
+            for task_name, task_result in analysis_result.task_results.items():
+                if task_result.status in ("failed", "timeout"):
+                    skill_errors.append(f"{task_name}: {task_result.error or task_result.status}")
 
             aggregator = EvidenceAggregator()
             evidence = aggregator.aggregate(skill_results)
@@ -718,23 +798,35 @@ class InvestigationEngine:
             graph_builder = GraphBuilder()
             graph_builder.build(graph, task.id, evidence, hypotheses)
 
+            # Add layer map nodes to graph
+            if layer_map:
+                for node in layer_map.nodes.values():
+                    graph.add_node(
+                        f"code:{node.name}",
+                        NodeType.FILE,
+                        {"label": node.name, "layer": node.layer, "file": node.file_path},
+                    )
+
             # Step 4: Build context (with connector error isolation)
             await _emit("building_context", "Building investigation context...")
             report.steps.append(InvestigationStep(
-                step_number=3,
+                step_number=4,
                 action="Building investigation context",
                 reasoning="Gathering task details, project knowledge, skill findings, and connector context",
             ))
             context = await self._build_context(
                 task, evidence, aggregator, graph, skill_results, investigation_plan,
                 deep_evidence=deep_evidence,
+                layer_map=layer_map,
+                classification=classification,
+                sql_results=sql_results,
             )
 
             # Step 5: Create tools (only from healthy connectors)
             tools = self._build_tools(task)
             tool_names = [t.name for t in tools]
             report.steps.append(InvestigationStep(
-                step_number=4,
+                step_number=5,
                 action="Preparing investigation tools",
                 reasoning=f"Available tools: {', '.join(tool_names) if tool_names else 'None'}",
             ))
@@ -742,7 +834,7 @@ class InvestigationEngine:
             # Step 6: Run the AI investigation (with graceful fallback)
             await _emit("ai_reasoning", "Running AI reasoning with Claude...")
             report.steps.append(InvestigationStep(
-                step_number=5,
+                step_number=6,
                 action="Running AI analysis",
                 tool_used="Claude via LangChain",
                 reasoning="Sending context, evidence, and task to Claude for multi-step reasoning",
@@ -933,6 +1025,9 @@ class InvestigationEngine:
         skill_results: dict | None = None,
         investigation_plan: Any | None = None,
         deep_evidence: dict | None = None,
+        layer_map: LayerMap | None = None,
+        classification: TaskClassification | None = None,
+        sql_results: list | None = None,
     ) -> str:
         """Assemble the full context with evidence quality tags."""
         parts = [
@@ -940,18 +1035,67 @@ class InvestigationEngine:
             "[TICKET] " + task.full_context,
         ]
 
+        # Task classification context
+        if classification:
+            parts.append(f"\n# Task Classification")
+            parts.append(f"Category: {classification.category} | Strategy: {classification.investigation_strategy}")
+            parts.append(f"Complexity: {classification.complexity} | Focus: {', '.join(classification.focus_areas[:5])}")
+            if classification.signals:
+                parts.append(f"Signals: {', '.join(classification.signals[:5])}")
+
         # Deep investigation evidence (highest priority -- most comprehensive)
         if deep_evidence:
             from task_analyzer.investigation.deep_investigator import DeepInvestigator
-            # Build the rich context from deep evidence
             di = DeepInvestigator([], {})
             di.evidence = deep_evidence
             deep_context = di.build_context_for_llm()
             if deep_context:
                 parts.append(f"\n# Deep Investigation Evidence\n{deep_context}")
 
+        # Code flow layer map (cross-layer execution paths)
+        if layer_map and layer_map.nodes:
+            parts.append(f"\n# [CODE] Code Flow Analysis")
+            parts.append(layer_map.summarize())
+
+            # Add detailed flow traces
+            for flow in layer_map.flows[:8]:
+                chain_parts = []
+                if flow.entry_point:
+                    chain_parts.append(f"Controller: {flow.entry_point}")
+                if flow.service:
+                    chain_parts.append(f"Service: {flow.service}")
+                if flow.repository:
+                    chain_parts.append(f"Repository: {flow.repository}")
+                if flow.db_tables:
+                    chain_parts.append(f"Tables: {', '.join(flow.db_tables[:3])}")
+                parts.append(f"  Flow: {' -> '.join(chain_parts)} (confidence: {flow.confidence:.0%})")
+
+            # Add code snippets from key nodes
+            for node in list(layer_map.nodes.values())[:10]:
+                if node.content_snippet:
+                    parts.append(f"\n### {node.layer}: {node.name} ({node.file_path})")
+                    parts.append(f"```\n{node.content_snippet[:400]}\n```")
+
+        # SQL Intelligence results
+        if sql_results:
+            parts.append(f"\n# [SQL] SQL Intelligence Results ({len(sql_results)} queries)")
+            parts.append("NOTE: SQL data shows current state only. It does NOT prove causation.")
+            for qr in sql_results[:8]:
+                parts.append(f"\n### {qr.get('table', '?')} ({qr.get('row_count', 0)} rows) - {qr.get('description', '')}")
+                parts.append(f"Insight: {qr.get('expected_insight', '')}")
+                cols = qr.get("columns", [])
+                if cols:
+                    parts.append(f"Columns: {', '.join(cols[:15])}")
+                for row in qr.get("sample_rows", [])[:3]:
+                    row_str = " | ".join(f"{k}={v[:50]}" for k, v in list(row.items())[:6])
+                    parts.append(f"  {row_str}")
+
         # Evidence quality summary -- tell Claude what it has and doesn't have
-        quality = self._build_evidence_quality_summary(evidence, skill_results, deep_evidence)
+        quality = self._build_evidence_quality_summary(
+            evidence, skill_results, deep_evidence,
+            layer_map=layer_map, classification=classification,
+            sql_results=sql_results,
+        )
         parts.append(f"\n# Evidence Quality Assessment\n{quality}")
 
         # Add system architecture from system_map.json
@@ -1077,6 +1221,9 @@ class InvestigationEngine:
     def _build_evidence_quality_summary(
         self, evidence: dict | None, skill_results: dict | None,
         deep_evidence: dict | None = None,
+        layer_map: LayerMap | None = None,
+        classification: TaskClassification | None = None,
+        sql_results: list | None = None,
     ) -> str:
         """
         Build a clear summary of what evidence is available and what is missing.
@@ -1157,10 +1304,38 @@ class InvestigationEngine:
         if has_errors:
             lines.append(f"[SQL] Error patterns: {len(evidence['errors'])} errors found")
 
+        # Check layer map (code flow analysis)
+        has_layer_map = layer_map is not None and len(layer_map.nodes) > 0
+        if has_layer_map:
+            stats = layer_map.export()["stats"]
+            lines.append(
+                f"[CODE] Code flow analysis: AVAILABLE "
+                f"({stats['controllers']} controllers, {stats['services']} services, "
+                f"{stats['repositories']} repositories, {stats['flows_traced']} execution flows)"
+            )
+            has_code_flows = True  # Override if layer map found flows
+        else:
+            lines.append("[CODE] Code flow analysis: NOT AVAILABLE")
+
+        # Check SQL intelligence results
+        if sql_results:
+            lines.append(f"[SQL] SQL Intelligence: {len(sql_results)} targeted queries executed")
+            has_sql = True
+        else:
+            lines.append("[SQL] SQL Intelligence: NOT AVAILABLE")
+
+        # Task classification context
+        if classification:
+            lines.append(f"[CLASSIFICATION] Task type: {classification.category} ({classification.investigation_strategy})")
+
         # Overall assessment
         lines.append("")
-        if has_code_refs and has_sql:
+        if has_code_refs and has_sql and has_layer_map:
+            lines.append("OVERALL: COMPREHENSIVE evidence available (code + flows + SQL). High confidence findings possible.")
+        elif has_code_refs and has_sql:
             lines.append("OVERALL: Code + SQL evidence available. Moderate-to-high confidence findings possible.")
+        elif has_code_refs and has_layer_map:
+            lines.append("OVERALL: Code + flow analysis available. Code-based findings with flow context possible.")
         elif has_code_refs:
             lines.append("OVERALL: Code evidence available but no SQL data. Code-based findings possible.")
         elif has_sql:
