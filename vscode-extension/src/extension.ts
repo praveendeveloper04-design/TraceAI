@@ -298,11 +298,14 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
 
                 // Animate stages while API runs
                 const stages = [
-                    { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
-                    { key: 'skills_execution', label: 'Running skills...', ms: 1200 },
-                    { key: 'evidence_aggregation', label: 'Aggregating evidence...', ms: 800 },
-                    { key: 'building_graph', label: 'Building graph...', ms: 600 },
-                    { key: 'building_context', label: 'Building context...', ms: 600 },
+                    { key: 'loading_ticket', label: 'Loading ticket...', ms: 400 },
+                    { key: 'classifying', label: 'Classifying task...', ms: 300 },
+                    { key: 'parallel_analysis', label: 'Running multi-layer analysis...', ms: 800 },
+                    { key: 'deep_investigation', label: 'Deep evidence collection...', ms: 1000 },
+                    { key: 'sql_intelligence', label: 'SQL intelligence...', ms: 600 },
+                    { key: 'evidence_aggregation', label: 'Aggregating evidence...', ms: 500 },
+                    { key: 'building_graph', label: 'Building graph...', ms: 400 },
+                    { key: 'building_context', label: 'Building context...', ms: 400 },
                     { key: 'ai_reasoning', label: 'AI reasoning...', ms: 0 },
                 ];
 

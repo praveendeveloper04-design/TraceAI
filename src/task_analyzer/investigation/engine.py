@@ -1238,7 +1238,7 @@ class InvestigationEngine:
         deep_refs = 0
         if deep_evidence:
             deep_code = len(deep_evidence.get("code_files", []))
-            deep_sql = len([t for t in deep_evidence.get("sql_tables", []) if t.get("row_count", 0) > 0])
+            deep_sql = len([t for t in deep_evidence.get("sql_tables", []) if (t.get("row_count") or 0) > 0])
             deep_flows = len(deep_evidence.get("code_flows", []))
             deep_refs = len(deep_evidence.get("repo_search_results", []))
             dq = deep_evidence.get("quality", {})

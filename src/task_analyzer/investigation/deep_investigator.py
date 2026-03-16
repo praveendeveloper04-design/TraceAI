@@ -533,7 +533,7 @@ class DeepInvestigator:
         code_files = len(self.evidence["code_files"])
         code_flows = len(self.evidence["code_flows"])
         sql_tables = len(self.evidence["sql_tables"])
-        sql_with_data = sum(1 for t in self.evidence["sql_tables"] if t.get("row_count", 0) > 0)
+        sql_with_data = sum(1 for t in self.evidence["sql_tables"] if (t.get("row_count") or 0) > 0)
         search_results = len(self.evidence["repo_search_results"])
 
         if code_files > 0:
@@ -607,7 +607,7 @@ class DeepInvestigator:
             parts.append(f"\n## [SQL] Database Query Results ({len(tables_with_data)} tables)")
             parts.append("NOTE: SQL data shows current state only, not causation.")
             for t in tables_with_data[:8]:
-                parts.append(f"\n### {t['name']} ({t.get('row_count', 0)} rows)")
+                parts.append(f"\n### {t['name']} ({t.get('row_count') or 0} rows)")
                 if t.get("columns"):
                     cols = ", ".join(c.get("name", "?") for c in t["columns"][:10])
                     parts.append(f"Columns: {cols}")
