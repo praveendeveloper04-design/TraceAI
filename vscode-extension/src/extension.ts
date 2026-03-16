@@ -296,50 +296,49 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
                     panelManager.updateProgress(taskId, 'cancelled', 'Investigation cancelled.', 'cancelled');
                 });
 
-                progress.report({ message: 'Starting investigation...', increment: 5 });
+                // Animate progress stages while the API call runs
+                const stages = [
+                    { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
+                    { key: 'classifying', label: 'Classifying task...', ms: 400 },
+                    { key: 'parallel_analysis', label: 'Running multi-layer analysis...', ms: 1000 },
+                    { key: 'deep_investigation', label: 'Deep evidence collection...', ms: 1500 },
+                    { key: 'sql_intelligence', label: 'SQL intelligence...', ms: 800 },
+                    { key: 'evidence_aggregation', label: 'Aggregating evidence...', ms: 600 },
+                    { key: 'building_graph', label: 'Building graph...', ms: 500 },
+                    { key: 'building_context', label: 'Building context...', ms: 500 },
+                    { key: 'ai_reasoning', label: 'AI reasoning...', ms: 0 },
+                ];
+
+                const advanceStages = async () => {
+                    for (const s of stages) {
+                        if (cancelled) { return; }
+                        progress.report({ message: s.label, increment: 10 });
+                        panelManager.updateProgress(taskId, s.key, s.label);
+                        if (s.ms > 0) { await new Promise(r => setTimeout(r, s.ms)); }
+                        else { break; }
+                    }
+                };
+
+                const stagePromise = advanceStages();
+                const apiPromise = apiService.investigate(taskId);
+
+                await stagePromise;
+                if (cancelled) { return; }
 
                 try {
-                    // Use SSE streaming for real progress, with fallback to blocking POST
-                    await new Promise<void>((resolve, reject) => {
-                        let lastPct = 0;
-                        apiService.investigateWithProgress(
-                            taskId,
-                            // onProgress — real backend progress events with percentage
-                            (stage: string, message: string, percentage: number) => {
-                                if (cancelled) { return; }
-                                const increment = Math.max(0, percentage - lastPct);
-                                lastPct = percentage;
-                                progress.report({ message: `[${percentage}%] ${message}`, increment });
-                                panelManager.updateProgress(taskId, stage, message);
-                            },
-                            // onComplete — final report received
-                            (report) => {
-                                if (cancelled) { resolve(); return; }
+                    const report = await apiPromise;
+                    if (cancelled) { return; }
 
-                                panelManager.updateProgress(taskId, 'generating_report', 'Generating report...');
-                                setTimeout(() => {
-                                    panelManager.updateProgress(taskId, 'complete', 'Investigation complete!', 'complete');
-                                    setTimeout(() => {
-                                        panelManager.showReport(taskId, report);
-                                        if (report.status === 'completed') {
-                                            vscode.window.showInformationMessage(
-                                                `Investigation complete: ${report.findings?.length || 0} finding(s)`
-                                            );
-                                        }
-                                        resolve();
-                                    }, 400);
-                                }, 300);
-                            },
-                            // onError — investigation failed
-                            (error: string) => {
-                                if (!cancelled) {
-                                    panelManager.updateProgress(taskId, 'error', `Failed: ${error}`, 'error');
-                                    vscode.window.showErrorMessage(`Investigation failed: ${error}`);
-                                }
-                                resolve(); // Don't reject — we handled the error
-                            },
-                        ).catch(reject);
-                    });
+                    panelManager.updateProgress(taskId, 'generating_report', 'Generating report...');
+                    await new Promise(r => setTimeout(r, 400));
+                    panelManager.updateProgress(taskId, 'complete', 'Investigation complete!', 'complete');
+                    await new Promise(r => setTimeout(r, 600));
+
+                    panelManager.showReport(taskId, report);
+
+                    if (report.status === 'completed') {
+                        vscode.window.showInformationMessage(`Investigation complete: ${report.findings?.length || 0} finding(s)`);
+                    }
                 } catch (err) {
                     if (!cancelled) {
                         panelManager.updateProgress(taskId, 'error', `Failed: ${err}`, 'error');
