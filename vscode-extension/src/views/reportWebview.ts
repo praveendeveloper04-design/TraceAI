@@ -95,7 +95,12 @@ export class ReportWebview {
                 'traceaiReport',
                 title,
                 vscode.ViewColumn.Beside,
-                { enableScripts: true, retainContextWhenHidden: true },
+                {
+                    enableScripts: true,
+                    retainContextWhenHidden: true,
+                    localResourceRoots: [this.extensionUri],
+                    enableFindWidget: true,
+                },
             );
             this.panel.onDidDispose(() => { this.panel = undefined; });
             this.panel.webview.onDidReceiveMessage(async (message) => {
@@ -115,6 +120,7 @@ export class ReportWebview {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'none';">
     <title>Investigation Progress</title>
     <style>
         body {
@@ -403,6 +409,7 @@ export class ReportWebview {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'none';">
     <title>Investigation Report</title>
     <style>
         :root {

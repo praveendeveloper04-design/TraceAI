@@ -41,7 +41,12 @@ export class PanelManager {
             'traceaiInvestigation',
             `Investigating: ${taskTitle.substring(0, 40)}`,
             vscode.ViewColumn.Active,
-            { enableScripts: true, retainContextWhenHidden: true },
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+                localResourceRoots: [this.extensionUri],
+                enableFindWidget: true,
+            },
         );
 
         panel.onDidDispose(() => {
@@ -115,7 +120,12 @@ export class PanelManager {
                 'traceaiInvestigation',
                 `Investigation: ${report.task_title?.substring(0, 40) || investigationId}`,
                 vscode.ViewColumn.Active,
-                { enableScripts: true, retainContextWhenHidden: true },
+                {
+                    enableScripts: true,
+                    retainContextWhenHidden: true,
+                    localResourceRoots: [this.extensionUri],
+                    enableFindWidget: true,
+                },
             );
 
             panel.onDidDispose(() => { this.panels.delete(key); });
@@ -147,7 +157,7 @@ export class PanelManager {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
     <style>
         body { font-family: var(--vscode-font-family, sans-serif); color: var(--vscode-editor-foreground, #ccc);
                background: var(--vscode-editor-background, #1e1e1e); padding: 32px; max-width: 600px; margin: 0 auto; }
@@ -261,7 +271,7 @@ export class PanelManager {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
     <style>
 body { font-family: var(--vscode-font-family, sans-serif); color: var(--vscode-editor-foreground, #ccc);
        background: var(--vscode-editor-background, #1e1e1e); padding: 24px; max-width: 900px; margin: 0 auto; line-height: 1.6; }
