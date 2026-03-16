@@ -138,7 +138,9 @@ export class ApiService {
 
     /**
      * Subscribe to live investigation progress via SSE.
-     * Calls onProgress for each stage, then onComplete with the final report.
+     * Uses Node.js http module for true chunk-by-chunk streaming.
+     * Axios buffers the entire response, so it cannot stream SSE events.
+     * Falls back to blocking POST /api/investigate if SSE connection fails.
      */
     async investigateWithProgress(
         taskId: string,
@@ -146,64 +148,80 @@ export class ApiService {
         onComplete: (report: InvestigationReport) => void,
         onError: (error: string) => void,
     ): Promise<void> {
-        const url = `http://127.0.0.1:${this.client.defaults.baseURL?.split(':').pop()?.replace('/', '') || '7420'}/api/investigate/${taskId}/stream`;
+        const http = require('http');
         const baseUrl = this.client.defaults.baseURL || 'http://127.0.0.1:7420';
+        const port = parseInt(baseUrl.split(':').pop()?.replace('/', '') || '7420', 10);
+        const path = `/api/investigate/${taskId}/stream`;
 
-        try {
-            const resp = await this.client.get(`/api/investigate/${taskId}/stream`, {
-                responseType: 'text',
-                timeout: 600000, // 10 minutes for long investigations
-                // Axios doesn't natively support SSE, so we parse the full response
+        return new Promise<void>((resolve) => {
+            let completed = false;
+            const finish = () => { if (!completed) { completed = true; resolve(); } };
+
+            const req = http.get({ hostname: '127.0.0.1', port, path, timeout: 600000 }, (res: any) => {
+                let buffer = '';
+
+                res.on('data', (chunk: Buffer) => {
+                    buffer += chunk.toString();
+
+                    // Parse complete SSE events (separated by double newline)
+                    const parts = buffer.split('\n\n');
+                    buffer = parts.pop() || '';
+
+                    for (const part of parts) {
+                        if (!part.trim()) { continue; }
+                        let eventType = '';
+                        let eventData = '';
+
+                        for (const line of part.split('\n')) {
+                            if (line.startsWith('event: ')) {
+                                eventType = line.substring(7).trim();
+                            } else if (line.startsWith('data: ')) {
+                                eventData = line.substring(6).trim();
+                            }
+                        }
+
+                        if (!eventType || !eventData) { continue; }
+
+                        try {
+                            if (eventType === 'progress') {
+                                const parsed = JSON.parse(eventData);
+                                onProgress(
+                                    parsed.stage || '',
+                                    parsed.message || '',
+                                    parsed.progress || 50,
+                                );
+                            } else if (eventType === 'complete') {
+                                const report = JSON.parse(eventData) as InvestigationReport;
+                                onComplete(report);
+                            } else if (eventType === 'error') {
+                                const err = JSON.parse(eventData);
+                                onError(err.error || 'Unknown error');
+                            }
+                        } catch { /* skip malformed JSON */ }
+                    }
+                });
+
+                res.on('end', finish);
+                res.on('error', () => {
+                    this.investigate(taskId)
+                        .then(report => { onComplete(report); finish(); })
+                        .catch(err => { onError(`Investigation failed: ${err}`); finish(); });
+                });
             });
 
-            const text = resp.data as string;
-            const lines = text.split('\n');
+            req.on('error', () => {
+                // SSE connection failed — fall back to blocking POST
+                this.investigate(taskId)
+                    .then(report => { onComplete(report); finish(); })
+                    .catch(err => { onError(`Investigation failed: ${err}`); finish(); });
+            });
 
-            let currentEvent = '';
-            let currentData = '';
-
-            for (const line of lines) {
-                if (line.startsWith('event: ')) {
-                    currentEvent = line.substring(7).trim();
-                } else if (line.startsWith('data: ')) {
-                    currentData = line.substring(6).trim();
-
-                    if (currentEvent === 'progress') {
-                        try {
-                            const parsed = JSON.parse(currentData);
-                            onProgress(
-                                parsed.stage || '',
-                                parsed.message || '',
-                                parsed.progress || 50,
-                            );
-                        } catch { /* skip malformed */ }
-                    } else if (currentEvent === 'complete') {
-                        try {
-                            const report = JSON.parse(currentData) as InvestigationReport;
-                            onComplete(report);
-                        } catch { /* skip malformed */ }
-                    } else if (currentEvent === 'error') {
-                        try {
-                            const err = JSON.parse(currentData);
-                            onError(err.error || 'Unknown error');
-                        } catch {
-                            onError(currentData);
-                        }
-                    }
-
-                    currentEvent = '';
-                    currentData = '';
-                }
-            }
-        } catch (error) {
-            // Fallback: use the non-streaming endpoint
-            try {
-                const report = await this.investigate(taskId);
-                onComplete(report);
-            } catch (fallbackError) {
-                onError(`Investigation failed: ${fallbackError}`);
-            }
-        }
+            req.on('timeout', () => {
+                req.destroy();
+                onError('Investigation timed out after 10 minutes');
+                finish();
+            });
+        });
     }
 
     async listInvestigations(limit: number = 20): Promise<InvestigationSummary[]> {
