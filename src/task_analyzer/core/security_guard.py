@@ -168,16 +168,23 @@ class SecurityGuard:
             )
         return True
 
-    def validate_sql_query(self, sql: str) -> str:
+    def validate_sql_query(self, sql: str, allow_schema_inspection: bool = False) -> str:
         """
         Validate SQL is read-only. Returns cleaned query or raises SecurityError.
+
+        Args:
+            sql: The SQL query to validate.
+            allow_schema_inspection: If True, permits INFORMATION_SCHEMA access
+                for system-generated schema discovery queries. This flag must
+                NEVER be set for user-supplied queries.
 
         Steps:
           1. Strip comments (-- and /* */)
           2. Split on semicolons — reject compound statements
           3. First keyword must be SELECT or WITH
           4. Scan ALL tokens for BLOCKED_SQL keywords
-          5. Return cleaned single statement
+          5. Block system objects (unless allow_schema_inspection)
+          6. Return cleaned single statement
         """
         # Step 1: Strip SQL comments
         cleaned = self._strip_sql_comments(sql)
@@ -211,16 +218,44 @@ class SecurityGuard:
                     f"Only read-only queries are allowed."
                 )
 
-        # Step 4b: Block access to system objects and metadata
+        # Step 5: Block access to system objects and metadata
         upper_statement = statement.upper()
-        for obj in self.BLOCKED_SQL_OBJECTS:
-            if obj in upper_statement:
-                raise SecurityError(
-                    f"Access to system object '{obj}' is blocked. "
-                    f"Queries against system metadata are not permitted."
-                )
 
-        # Step 5: Return cleaned single statement
+        if allow_schema_inspection:
+            # When schema inspection is allowed, only permit INFORMATION_SCHEMA
+            # Still block all other dangerous system objects
+            ALWAYS_BLOCKED = (
+                "SYS.",
+                "SYSOBJECTS",
+                "SYSCOLUMNS",
+                "SYSINDEXES",
+                "SYSUSERS",
+                "XP_",
+                "SP_CONFIGURE",
+                "SP_EXECUTESQL",
+                "MASTER..",
+                "MSDB..",
+                "TEMPDB..",
+                "OPENROWSET",
+                "OPENQUERY",
+                "OPENDATASOURCE",
+            )
+            for obj in ALWAYS_BLOCKED:
+                if obj in upper_statement:
+                    raise SecurityError(
+                        f"Access to system object '{obj}' is blocked. "
+                        f"Queries against system metadata are not permitted."
+                    )
+        else:
+            # Full blocking — no system objects at all
+            for obj in self.BLOCKED_SQL_OBJECTS:
+                if obj in upper_statement:
+                    raise SecurityError(
+                        f"Access to system object '{obj}' is blocked. "
+                        f"Queries against system metadata are not permitted."
+                    )
+
+        # Step 6: Return cleaned single statement
         return statement
 
     def validate_repo_operation(self, operation: str, path: str) -> bool:

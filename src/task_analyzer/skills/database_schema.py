@@ -5,9 +5,9 @@ Queries INFORMATION_SCHEMA to discover tables and columns, caches the
 result to ~/.traceai/db_profiles/<database>.json, and provides the
 schema to Claude as investigation context.
 
-Security: Uses a dedicated SecurityGuard bypass for schema queries only.
-The INFORMATION_SCHEMA block in SecurityGuard is bypassed ONLY by this
-skill using raw connector access, never by user-supplied queries.
+Security: ALL schema queries are validated through SecurityGuard with
+allow_schema_inspection=True. This permits INFORMATION_SCHEMA access
+while still blocking all write operations and dangerous system objects.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from task_analyzer.core.security_guard import SecurityGuard
 from task_analyzer.skills.base_skill import BaseSkill
 
 logger = structlog.get_logger(__name__)
@@ -67,10 +68,12 @@ class DatabaseSchemaSkill(BaseSkill):
                 self._add_to_graph(graph, task.id, result["tables"], db_name)
                 return result
 
-            # Query schema using raw engine access
+            # Query schema using SecurityGuard-validated queries
             try:
                 engine = db_connector._get_engine()
                 from sqlalchemy import inspect, text
+
+                guard = SecurityGuard(safe_mode=True)
 
                 # Determine which database to query from the investigation plan
                 plan = context.get("investigation_plan")
@@ -81,23 +84,35 @@ class DatabaseSchemaSkill(BaseSkill):
                 tables_data = []
 
                 if tenant_db:
-                    # Query the tenant-specific database
+                    # Query the tenant-specific database — validated with schema inspection
+                    table_query = (
+                        f"SELECT TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
+                        f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"
+                    )
+                    validated_table_query = guard.validate_sql_query(
+                        table_query, allow_schema_inspection=True
+                    )
+
                     with engine.connect() as conn:
                         conn.execute(text("SET ROWCOUNT 100"))
-                        result_rows = conn.execute(text(
-                            f"SELECT TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
-                            f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"
-                        ))
+                        result_rows = conn.execute(text(validated_table_query))
                         table_names = [row[0] for row in result_rows][:50]
 
-                    # Get columns for each table
+                    # Get columns for each table — validated with schema inspection
+                    col_query_template = (
+                        f"SELECT COLUMN_NAME, DATA_TYPE FROM {tenant_db}.INFORMATION_SCHEMA.COLUMNS "
+                        f"WHERE TABLE_NAME = :tbl ORDER BY ORDINAL_POSITION"
+                    )
+                    validated_col_query = guard.validate_sql_query(
+                        col_query_template, allow_schema_inspection=True
+                    )
+
                     with engine.connect() as conn:
                         for table_name in table_names:
                             try:
-                                col_rows = conn.execute(text(
-                                    f"SELECT COLUMN_NAME, DATA_TYPE FROM {tenant_db}.INFORMATION_SCHEMA.COLUMNS "
-                                    f"WHERE TABLE_NAME = :tbl ORDER BY ORDINAL_POSITION"
-                                ), {"tbl": table_name})
+                                col_rows = conn.execute(
+                                    text(validated_col_query), {"tbl": table_name}
+                                )
                                 col_info = [
                                     {"name": row[0], "type": row[1]}
                                     for row in col_rows

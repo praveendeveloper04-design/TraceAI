@@ -6,7 +6,8 @@ this skill executes specific queries determined by the InvestigationPlanner.
 The planner identifies relevant tables from the system map, and this skill
 fetches recent rows from those tables.
 
-All queries are read-only and validated through SecurityGuard.
+Security: ALL queries are validated through SecurityGuard before execution.
+System-generated queries use allow_schema_inspection=False (no metadata access).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Any
 
 import structlog
 
+from task_analyzer.core.security_guard import SecurityError
 from task_analyzer.skills.base_skill import BaseSkill
 
 logger = structlog.get_logger(__name__)
@@ -66,7 +68,7 @@ class SQLQuerySkill(BaseSkill):
 
             security_guard.validate_tool("DBReader", "select_query")
 
-            # Execute planned queries (which include cross-database prefixes)
+            # Execute planned queries — ALL validated through SecurityGuard
             for i, query in enumerate(planned_queries[:5]):
                 try:
                     # Extract table name for logging
@@ -74,15 +76,15 @@ class SQLQuerySkill(BaseSkill):
                     table_match = re.search(r'\[(\w+)\]', query)
                     table_name = table_match.group(1) if table_match else f"query_{i}"
 
-                    # Use raw engine execution to support cross-database queries
-                    # SecurityGuard validation is bypassed for planner-generated queries
-                    # because they are system-generated, not user-supplied
+                    # Validate query through SecurityGuard (read-only enforcement)
+                    validated_query = security_guard.validate_sql_query(query)
+
                     engine = db_connector._get_engine()
                     from sqlalchemy import text
                     with engine.connect() as c:
                         c.execute(text("SET ROWCOUNT 20"))
                         c.execute(text("SET LOCK_TIMEOUT 5000"))
-                        rows_raw = c.execute(text(query))
+                        rows_raw = c.execute(text(validated_query))
                         rows = [dict(row._mapping) for row in rows_raw.fetchall()]
 
                     result["tables_queried"].append(table_name)
@@ -98,7 +100,7 @@ class SQLQuerySkill(BaseSkill):
 
                     result["query_results"].append({
                         "table": table_name,
-                        "query": query,
+                        "query": validated_query,
                         "row_count": len(rows),
                         "sample_rows": sample,
                         "columns": list(rows[0].keys()) if rows else [],
@@ -114,6 +116,8 @@ class SQLQuerySkill(BaseSkill):
 
                     logger.info("sql_query_executed", table=table_name, rows=len(rows))
 
+                except SecurityError as sec_err:
+                    logger.warning("sql_query_blocked_by_guard", query=query[:80], error=str(sec_err))
                 except Exception as exc:
                     logger.debug("sql_query_failed", query=query[:80], error=str(exc)[:100])
 

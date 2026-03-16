@@ -39,6 +39,8 @@ from typing import Any
 
 import structlog
 
+from task_analyzer.core.security_guard import SecurityGuard
+
 logger = structlog.get_logger(__name__)
 
 
@@ -49,12 +51,17 @@ class DeepInvestigator:
     Unlike the skill-based approach that runs each skill once, this
     investigator runs multiple passes, each time going deeper based
     on what was found in the previous pass.
+
+    Security: ALL SQL queries are validated through SecurityGuard before
+    execution. Schema inspection queries use allow_schema_inspection=True.
+    Data queries use the default strict mode.
     """
 
     def __init__(self, profiles: list, connectors: dict, plan: Any = None) -> None:
         self.profiles = profiles
         self.connectors = connectors
         self.plan = plan
+        self._guard = SecurityGuard(safe_mode=True)
         self.evidence: dict[str, Any] = {
             "code_files": [],       # {path, content_snippet, relevance}
             "code_flows": [],       # {controller, service, repository, method}
@@ -225,12 +232,18 @@ class DeepInvestigator:
             engine = db_connector._get_engine()
             from sqlalchemy import text
 
+            # Validate schema inspection query through SecurityGuard
+            schema_query = (
+                f"SELECT TABLE_SCHEMA, TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
+                f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
+            )
+            validated_schema_query = self._guard.validate_sql_query(
+                schema_query, allow_schema_inspection=True
+            )
+
             with engine.connect() as conn:
                 conn.execute(text("SET ROWCOUNT 1000"))
-                result = conn.execute(text(
-                    f"SELECT TABLE_SCHEMA, TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
-                    f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
-                ))
+                result = conn.execute(text(validated_schema_query))
                 all_tables = [(row[0], row[1]) for row in result]
 
             # Match entities to tables
@@ -256,12 +269,17 @@ class DeepInvestigator:
             # Also get column info for matched tables
             for table_info in self.evidence["sql_tables"][:20]:
                 try:
+                    col_query = (
+                        f"SELECT COLUMN_NAME, DATA_TYPE FROM {tenant_db}.INFORMATION_SCHEMA.COLUMNS "
+                        f"WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table "
+                        f"ORDER BY ORDINAL_POSITION"
+                    )
+                    validated_col_query = self._guard.validate_sql_query(
+                        col_query, allow_schema_inspection=True
+                    )
                     with engine.connect() as conn:
-                        cols = conn.execute(text(
-                            f"SELECT COLUMN_NAME, DATA_TYPE FROM {tenant_db}.INFORMATION_SCHEMA.COLUMNS "
-                            f"WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table "
-                            f"ORDER BY ORDINAL_POSITION"
-                        ), {"schema": table_info["schema"], "table": table_info["table"]})
+                        cols = conn.execute(text(validated_col_query),
+                            {"schema": table_info["schema"], "table": table_info["table"]})
                         table_info["columns"] = [{"name": r[0], "type": r[1]} for r in cols]
                         self.evidence["sql_schema"].append({
                             "table": f"{table_info['schema']}.{table_info['table']}",
@@ -284,10 +302,15 @@ class DeepInvestigator:
             for table_info in self.evidence["sql_tables"][:10]:
                 try:
                     qualified = f"[{tenant_db}].[{table_info['schema']}].[{table_info['table']}]"
+                    data_query = f"SELECT TOP 10 * FROM {qualified} ORDER BY 1 DESC"
+
+                    # Validate through SecurityGuard — strict mode (no schema inspection)
+                    validated_data_query = self._guard.validate_sql_query(data_query)
+
                     with engine.connect() as conn:
                         conn.execute(text("SET ROWCOUNT 10"))
                         conn.execute(text("SET LOCK_TIMEOUT 5000"))
-                        rows = conn.execute(text(f"SELECT TOP 10 * FROM {qualified} ORDER BY 1 DESC"))
+                        rows = conn.execute(text(validated_data_query))
                         data = []
                         for row in rows.fetchall():
                             row_dict = {}
@@ -464,16 +487,26 @@ class DeepInvestigator:
             with engine.connect() as conn:
                 for table_name in new_tables[:5]:
                     try:
-                        result = conn.execute(text(
+                        # Validate schema lookup through SecurityGuard
+                        schema_lookup = (
                             f"SELECT TABLE_SCHEMA FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
                             f"WHERE TABLE_NAME = :tbl"
-                        ), {"tbl": table_name})
+                        )
+                        validated_lookup = self._guard.validate_sql_query(
+                            schema_lookup, allow_schema_inspection=True
+                        )
+                        result = conn.execute(text(validated_lookup), {"tbl": table_name})
                         schemas = [row[0] for row in result]
                         if schemas:
                             schema = schemas[0]
                             qualified = f"[{tenant_db}].[{schema}].[{table_name}]"
+                            data_query = f"SELECT TOP 10 * FROM {qualified} ORDER BY 1 DESC"
+
+                            # Validate data query through SecurityGuard — strict mode
+                            validated_data = self._guard.validate_sql_query(data_query)
+
                             conn.execute(text("SET ROWCOUNT 10"))
-                            rows = conn.execute(text(f"SELECT TOP 10 * FROM {qualified} ORDER BY 1 DESC"))
+                            rows = conn.execute(text(validated_data))
                             data = [dict(row._mapping) for row in rows.fetchall()]
                             sample = [{str(k): str(v)[:100] for k, v in row.items()} for row in data[:5]]
                             self.evidence["sql_tables"].append({

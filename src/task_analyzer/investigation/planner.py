@@ -123,21 +123,33 @@ class SchemaDiscovery:
         self._cached_tables: list[str] | None = None
 
     def discover_tables(self, db_connector, tenant_db: str | None = None) -> list[str]:
-        """Query the database for all table names with schema prefixes."""
+        """Query the database for all table names with schema prefixes.
+
+        Security: Schema queries are validated through SecurityGuard with
+        allow_schema_inspection=True.
+        """
         if self._cached_tables is not None:
             return self._cached_tables
 
         try:
             engine = db_connector._get_engine()
             from sqlalchemy import text
+            from task_analyzer.core.security_guard import SecurityGuard
+
+            guard = SecurityGuard(safe_mode=True)
 
             if tenant_db:
+                schema_query = (
+                    f"SELECT TABLE_SCHEMA, TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
+                    f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
+                )
+                validated_query = guard.validate_sql_query(
+                    schema_query, allow_schema_inspection=True
+                )
+
                 with engine.connect() as conn:
                     conn.execute(text("SET ROWCOUNT 500"))
-                    result = conn.execute(text(
-                        f"SELECT TABLE_SCHEMA, TABLE_NAME FROM {tenant_db}.INFORMATION_SCHEMA.TABLES "
-                        f"WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
-                    ))
+                    result = conn.execute(text(validated_query))
                     # Store as schema.table for fully qualified access
                     self._cached_tables = [f"{row[0]}.{row[1]}" for row in result]
             else:

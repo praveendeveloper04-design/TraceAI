@@ -141,12 +141,16 @@ class SQLIntelligence:
     Uses task classification, code flow analysis, and schema discovery
     to generate targeted queries that reveal relevant data.
 
-    All queries are read-only and validated before execution.
+    Security: ALL queries are validated through SecurityGuard before execution.
+    Only SELECT queries are generated. No write operations ever.
     """
 
     def __init__(self, tenant_db: str | None = None) -> None:
         self.tenant_db = tenant_db
         self._schema_cache: dict[str, list[dict]] = {}
+        # SecurityGuard instance for validating all generated queries
+        from task_analyzer.core.security_guard import SecurityGuard
+        self._guard = SecurityGuard(safe_mode=True)
 
     def generate_queries(
         self,
@@ -245,6 +249,9 @@ class SQLIntelligence:
 
         Uses INFORMATION_SCHEMA to find actual FK constraints,
         plus heuristic matching for inferred relationships.
+
+        Security: Schema inspection queries are validated through SecurityGuard
+        with allow_schema_inspection=True (permits INFORMATION_SCHEMA only).
         """
         relationships: list[TableRelationship] = []
 
@@ -255,28 +262,37 @@ class SQLIntelligence:
             engine = db_connector._get_engine()
             from sqlalchemy import text
 
+            # Build and validate the FK discovery query
+            fk_query = (
+                f"SELECT "
+                f"fk.TABLE_SCHEMA + '.' + fk.TABLE_NAME AS source_table, "
+                f"cu.COLUMN_NAME AS source_column, "
+                f"pk.TABLE_SCHEMA + '.' + pk.TABLE_NAME AS target_table, "
+                f"pt.COLUMN_NAME AS target_column "
+                f"FROM {self.tenant_db}.INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc "
+                f"JOIN {self.tenant_db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS fk "
+                f"ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME "
+                f"AND rc.CONSTRAINT_SCHEMA = fk.CONSTRAINT_SCHEMA "
+                f"JOIN {self.tenant_db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS pk "
+                f"ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME "
+                f"AND rc.UNIQUE_CONSTRAINT_SCHEMA = pk.CONSTRAINT_SCHEMA "
+                f"JOIN {self.tenant_db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE cu "
+                f"ON fk.CONSTRAINT_NAME = cu.CONSTRAINT_NAME "
+                f"AND fk.CONSTRAINT_SCHEMA = cu.CONSTRAINT_SCHEMA "
+                f"JOIN {self.tenant_db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE pt "
+                f"ON pk.CONSTRAINT_NAME = pt.CONSTRAINT_NAME "
+                f"AND pk.CONSTRAINT_SCHEMA = pt.CONSTRAINT_SCHEMA"
+            )
+
+            # Validate through SecurityGuard (schema inspection allowed)
+            validated_fk_query = self._guard.validate_sql_query(
+                fk_query, allow_schema_inspection=True
+            )
+
             with engine.connect() as conn:
-                # Query actual foreign keys
-                result = conn.execute(text(f"""
-                    SELECT
-                        fk.TABLE_SCHEMA + '.' + fk.TABLE_NAME AS source_table,
-                        cu.COLUMN_NAME AS source_column,
-                        pk.TABLE_SCHEMA + '.' + pk.TABLE_NAME AS target_table,
-                        pt.COLUMN_NAME AS target_column
-                    FROM {self.tenant_db}.INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
-                    JOIN {self.tenant_db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS fk
-                        ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
-                        AND rc.CONSTRAINT_SCHEMA = fk.CONSTRAINT_SCHEMA
-                    JOIN {self.tenant_db}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS pk
-                        ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
-                        AND rc.UNIQUE_CONSTRAINT_SCHEMA = pk.CONSTRAINT_SCHEMA
-                    JOIN {self.tenant_db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE cu
-                        ON fk.CONSTRAINT_NAME = cu.CONSTRAINT_NAME
-                        AND fk.CONSTRAINT_SCHEMA = cu.CONSTRAINT_SCHEMA
-                    JOIN {self.tenant_db}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE pt
-                        ON pk.CONSTRAINT_NAME = pt.CONSTRAINT_NAME
-                        AND pk.CONSTRAINT_SCHEMA = pt.CONSTRAINT_SCHEMA
-                """))
+                conn.execute(text("SET ROWCOUNT 200"))
+                conn.execute(text("SET LOCK_TIMEOUT 5000"))
+                result = conn.execute(text(validated_fk_query))
 
                 for row in result:
                     src_table = row[0]
@@ -312,7 +328,7 @@ class SQLIntelligence:
         """
         Execute generated queries and return results.
 
-        Each query is validated through SecurityGuard before execution.
+        Security: Every query is validated through SecurityGuard before execution.
         Results are truncated to prevent memory issues.
         """
         results = []
@@ -323,13 +339,17 @@ class SQLIntelligence:
         try:
             engine = db_connector._get_engine()
             from sqlalchemy import text
+            from task_analyzer.core.security_guard import SecurityError
 
             for query in queries[:max_queries]:
                 try:
+                    # Validate through SecurityGuard — read-only enforcement
+                    validated_sql = self._guard.validate_sql_query(query.sql)
+
                     with engine.connect() as conn:
                         conn.execute(text("SET ROWCOUNT 50"))
                         conn.execute(text("SET LOCK_TIMEOUT 5000"))
-                        rows = conn.execute(text(query.sql))
+                        rows = conn.execute(text(validated_sql))
                         data = []
                         columns = []
                         for row in rows.fetchall():
@@ -346,13 +366,19 @@ class SQLIntelligence:
                             "table": query.table,
                             "query_type": query.query_type,
                             "description": query.description,
-                            "sql": query.sql,
+                            "sql": validated_sql,
                             "row_count": len(data),
                             "columns": columns[:20],
                             "sample_rows": data[:10],
                             "expected_insight": query.expected_insight,
                         })
 
+                except SecurityError as sec_err:
+                    logger.warning(
+                        "sql_intelligence_query_blocked",
+                        table=query.table,
+                        error=str(sec_err)[:100],
+                    )
                 except Exception as exc:
                     logger.debug(
                         "query_execution_failed",
