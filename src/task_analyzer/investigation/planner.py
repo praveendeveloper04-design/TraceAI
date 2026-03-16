@@ -290,6 +290,7 @@ class InvestigationPlan:
         self.repos: list[str] = []
         self.skills: list[str] = []
         self.tables: list[str] = []          # Schema-discovered tables (fallback)
+        self.table_ranks: dict[str, int] = {}  # table → rank (1=code, 2=index, 3=fk, 4=fuzzy)
         self.code_tables: list[str] = []     # Code-discovered tables (preferred)
         self.queries: list[str] = []
         self.matched_flows: list[str] = []
@@ -373,22 +374,25 @@ class InvestigationPlanner:
 
     Uses dynamic discovery:
       1. EntityExtractor identifies entities from task text
-      2. SchemaDiscovery finds matching tables in the database
+      2. RankedTableSelector picks relevant tables (replaces fuzzy matching)
       3. SystemMap provides infrastructure context (services, flows, tenants)
 
     No hardcoded keyword-to-table mappings.
     """
 
-    def __init__(self, system_map: SystemMap | None = None) -> None:
+    def __init__(self, system_map: SystemMap | None = None,
+                 workspace_index=None) -> None:
         self.system_map = system_map or load_system_map()
         self.entity_extractor = EntityExtractor()
         self.schema_discovery = SchemaDiscovery()
+        self.workspace_index = workspace_index
 
     def plan(
         self,
         task_title: str,
         task_description: str = "",
         db_connector=None,
+        classification=None,
     ) -> InvestigationPlan:
         """
         Analyze the task and produce an investigation plan.
@@ -397,6 +401,7 @@ class InvestigationPlanner:
             task_title: The task title
             task_description: The task description
             db_connector: Optional SQL connector for schema discovery
+            classification: Optional TaskClassification for skill selection
         """
         plan = InvestigationPlan()
         text = f"{task_title} {task_description}".lower()
@@ -412,14 +417,36 @@ class InvestigationPlanner:
                 plan.tenant_db = self.system_map.resolve_tenant_db(tenant_name)
                 break
 
-        # Step 3: Discover database schema and match entities to tables
+        # Step 3: Discover database schema and select tables using ranked selector
         if db_connector:
             all_tables = self.schema_discovery.discover_tables(db_connector, plan.tenant_db)
-            plan.tables = self.schema_discovery.match_entities_to_tables(plan.entities, all_tables)
 
-            # Build queries -- tables are schema-qualified (e.g., "Operation.Trip")
-            for table in plan.tables[:5]:
-                # Split schema.table and bracket each part
+            # Get code-discovered tables from workspace index
+            index_code_tables = []
+            if self.workspace_index:
+                index_code_tables = self.workspace_index.get_all_code_tables()
+
+            # Use ranked selection instead of fuzzy matching
+            try:
+                from task_analyzer.workspace_intelligence.ranked_table_selector import RankedTableSelector
+                selector = RankedTableSelector(
+                    workspace_index=self.workspace_index,
+                    max_tables=12,
+                )
+                ranked = selector.select(
+                    entities=plan.entities,
+                    all_schema_tables=all_tables,
+                    code_tables=index_code_tables or None,
+                )
+                plan.tables = [r.qualified_name for r in ranked]
+                plan.table_ranks = {r.qualified_name: r.rank for r in ranked}
+            except Exception as exc:
+                logger.debug("ranked_selection_fallback", error=str(exc))
+                # Fallback to old fuzzy matching
+                plan.tables = self.schema_discovery.match_entities_to_tables(plan.entities, all_tables)
+
+            # Build queries for selected tables
+            for table in plan.tables[:8]:
                 parts = table.split(".")
                 bracketed = ".".join(f"[{p}]" for p in parts)
                 if plan.tenant_db:
@@ -449,20 +476,24 @@ class InvestigationPlanner:
             if repo and repo not in plan.repos:
                 plan.repos.append(repo)
 
-        # Step 7: Determine skills
-        plan.skills.append("RepoAnalysisSkill")
-        plan.skills.append("TicketContextSkill")
-        if plan.tables:
-            plan.skills.append("DatabaseSchemaSkill")
-            plan.skills.append("SQLQuerySkill")
-        if plan.repos and len(plan.repos) > 1:
-            plan.skills.append("CrossRepoAnalysisSkill")
+        # Step 7: Determine skills (dynamic based on classification)
+        if classification:
+            plan.skills = list(classification.suggested_skills)
+        else:
+            plan.skills.append("RepoAnalysisSkill")
+            plan.skills.append("TicketContextSkill")
+            if plan.tables:
+                plan.skills.append("DatabaseSchemaSkill")
+                plan.skills.append("SQLQuerySkill")
+            if plan.repos and len(plan.repos) > 1:
+                plan.skills.append("CrossRepoAnalysisSkill")
 
         logger.info(
             "investigation_planned",
             entities=plan.entities[:5],
             tenant=plan.tenant,
-            tables=plan.tables,
+            tables=plan.tables[:5],
+            table_count=len(plan.tables),
             systems=plan.systems,
             repos=plan.repos,
         )

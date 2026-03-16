@@ -140,6 +140,15 @@ class DeepInvestigator:
         self.evidence["loops_completed"] = 1
         await _emit(f"Loop 1 complete: {len(self.evidence['code_files'])} files, {len(self.evidence['sql_tables'])} tables")
 
+        # Early stopping: skip remaining loops if confidence is already high
+        confidence = self._confidence_score()
+        if confidence >= 0.7:
+            await _emit(f"Confidence {confidence:.0%} >= 70% after Loop 1 -- skipping remaining loops")
+            self.evidence["quality"] = self._assess_evidence_quality()
+            self.evidence["loops_completed"] = 3
+            self.evidence["early_stop"] = True
+            return self.evidence
+
         # ── LOOP 2: Targeted Deepening ───────────────────────────────────
 
         await _emit("Loop 2: Targeted deepening -- reading code and tracing flows...")
@@ -164,6 +173,15 @@ class DeepInvestigator:
 
         self.evidence["loops_completed"] = 2
         await _emit(f"Loop 2 complete: {len(self.evidence['code_files'])} files, {len(self.evidence['sql_tables'])} tables, {len(self.evidence['code_flows'])} flows")
+
+        # Early stopping: skip Loop 3 if confidence is sufficient
+        confidence = self._confidence_score()
+        if confidence >= 0.7:
+            await _emit(f"Confidence {confidence:.0%} >= 70% after Loop 2 -- skipping verification loop")
+            self.evidence["quality"] = self._assess_evidence_quality()
+            self.evidence["loops_completed"] = 3
+            self.evidence["early_stop"] = True
+            return self.evidence
 
         # ── LOOP 3: Verification ─────────────────────────────────────────
 
@@ -557,6 +575,41 @@ class DeepInvestigator:
                         pass
                     if len(self.evidence["code_files"]) >= 150:
                         return
+
+    def _confidence_score(self) -> float:
+        """
+        Calculate a confidence score (0.0-1.0) for the current evidence.
+
+        Used for early stopping: if confidence >= 0.7, skip remaining loops.
+
+        Scoring:
+          - Code files with content (read and analyzed): 0.15 per file (max 0.3)
+          - Code flows traced (Controller/Service/Repository): 0.1 per flow (max 0.2)
+          - SQL tables with data: 0.05 per table (max 0.2)
+          - Repo search results (targeted matches): 0.02 per result (max 0.15)
+          - SQL schema discovered: 0.15 if any schema found
+        """
+        score = 0.0
+
+        files_with_content = sum(1 for f in self.evidence["code_files"] if f.get("content"))
+        score += min(files_with_content * 0.15, 0.3)
+
+        code_flows = len(self.evidence["code_flows"])
+        score += min(code_flows * 0.1, 0.2)
+
+        tables_with_data = sum(
+            1 for t in self.evidence["sql_tables"]
+            if (t.get("row_count") or 0) > 0
+        )
+        score += min(tables_with_data * 0.05, 0.2)
+
+        search_results = len(self.evidence["repo_search_results"])
+        score += min(search_results * 0.02, 0.15)
+
+        if self.evidence["sql_schema"]:
+            score += 0.15
+
+        return min(score, 1.0)
 
     def _assess_evidence_quality(self) -> dict[str, Any]:
         """Assess the quality of collected evidence."""

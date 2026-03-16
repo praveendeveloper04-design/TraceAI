@@ -427,6 +427,7 @@ class InvestigationEngine:
         self.task_classifier = TaskClassifier()
         self.code_flow_engine = CodeFlowAnalysisEngine()
         self.sql_intelligence = SQLIntelligence()
+        self._workspace_index = None  # Set during workspace loading
 
         # Initialize skill registry
         self.skill_registry = SkillRegistry()
@@ -467,6 +468,53 @@ class InvestigationEngine:
                     repos=len(workspace.repos),
                     profiles=len(self.profiles),
                 )
+
+                # Initialize workspace intelligence index
+                try:
+                    from task_analyzer.workspace_intelligence.index import WorkspaceIndex
+                    self._workspace_index = WorkspaceIndex()
+
+                    # Auto-index repos that haven't been indexed or are stale (>24h)
+                    for repo_info in workspace.repos:
+                        repo_name = repo_info.get("name", "")
+                        repo_path = repo_info.get("path", "")
+                        if not repo_name or not repo_path:
+                            continue
+                        age = self._workspace_index.get_repo_scan_age(repo_name)
+                        if age is None or age > 86400:  # 24 hours
+                            logger.info("indexing_repository", repo=repo_name)
+                            self._workspace_index.index_repository(repo_name, repo_path)
+
+                    # Build schema relations if SQL connector available
+                    db_conn = None
+                    for cn, co in registry.get_all_instances().items():
+                        ct = getattr(co, "connector_type", None)
+                        if ct and hasattr(ct, "value") and ct.value == "sql_database":
+                            db_conn = co
+                            break
+                    if db_conn:
+                        from task_analyzer.workspace_intelligence.schema_relation_builder import SchemaRelationBuilder
+                        builder = SchemaRelationBuilder()
+                        # Use first tenant DB from system map if available
+                        try:
+                            from task_analyzer.investigation.planner import load_system_map
+                            smap = load_system_map()
+                            tenant_names = smap.get_all_tenant_names()
+                            if tenant_names:
+                                tenant_db = smap.resolve_tenant_db(tenant_names[0])
+                                fk_age = self._workspace_index._get_conn().execute(
+                                    "SELECT COUNT(*) FROM db_foreign_keys"
+                                ).fetchone()[0]
+                                if fk_age == 0:
+                                    builder.build(self._workspace_index, db_conn, tenant_db)
+                        except Exception as fk_exc:
+                            logger.debug("schema_relation_build_skipped", error=str(fk_exc)[:100])
+
+                    idx_stats = self._workspace_index.get_stats()
+                    logger.info("workspace_index_ready", **idx_stats)
+                except Exception as idx_exc:
+                    self._workspace_index = None
+                    logger.debug("workspace_index_skipped", error=str(idx_exc)[:100])
         except Exception as exc:
             logger.debug("workspace_load_skipped", error=str(exc))
 
@@ -559,10 +607,13 @@ class InvestigationEngine:
                         db_connector_for_planner = conn
                         break
 
-                planner = InvestigationPlanner()
+                planner = InvestigationPlanner(
+                    workspace_index=getattr(self, '_workspace_index', None),
+                )
                 investigation_plan = planner.plan(
                     task.title, task.description,
                     db_connector=db_connector_for_planner,
+                    classification=classification,
                 )
                 logger.info(
                     "investigation_plan_ready",
@@ -654,13 +705,36 @@ class InvestigationEngine:
                 timeout=60, priority=2,
             )
 
-            # Task C: Run available skills in parallel
+            # Task C: Run available skills in parallel (filtered by classification)
             available_skills = self.skill_registry.list_available(connectors)
             skill_context = {"profiles": self.profiles}
             if investigation_plan:
                 skill_context["investigation_plan"] = investigation_plan
 
+            # Dynamic skill orchestration: only run skills suggested by classification
+            suggested_skill_names = set()
+            if investigation_plan and investigation_plan.skills:
+                # Map skill class names to registry names
+                skill_name_map = {
+                    "RepoAnalysisSkill": "repo_analysis",
+                    "TicketContextSkill": "ticket_context",
+                    "DatabaseAnalysisSkill": "database_analysis",
+                    "DatabaseSchemaSkill": "database_schema",
+                    "SQLQuerySkill": "sql_query",
+                    "CrossRepoAnalysisSkill": "cross_repo_analysis",
+                    "CodeAnalysisSkill": "code_analysis",
+                    "LogAnalysisSkill": "log_analysis",
+                }
+                for s in investigation_plan.skills:
+                    mapped = skill_name_map.get(s, s)
+                    suggested_skill_names.add(mapped)
+
             for skill in available_skills:
+                # Skip skills not suggested by classification (if classification provided)
+                if suggested_skill_names and skill.name not in suggested_skill_names:
+                    logger.debug("skill_skipped_by_classification", skill=skill.name)
+                    continue
+
                 async def _run_skill(s=skill):
                     return await s.run(task, skill_context, self.guard, connectors, graph)
                 parallel.add_task(
