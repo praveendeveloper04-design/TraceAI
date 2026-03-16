@@ -52,11 +52,13 @@
             "traceai": [
                 {
                     "id": "traceai.tasks",
-                    "name": "My Tasks"
+                    "name": "My Tasks",
+                    "type": "tree"
                 },
                 {
                     "id": "traceai.investigations",
-                    "name": "Investigations"
+                    "name": "Investigations",
+                    "type": "tree"
                 }
             ]
         },
