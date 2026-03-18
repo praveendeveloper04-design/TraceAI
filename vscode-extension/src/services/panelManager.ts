@@ -179,22 +179,31 @@ export class PanelManager {
             let appliedCount = 0;
             for (const file of patchResult.files) {
                 try {
-                    const originalUri = vscode.Uri.parse(`untitled:${file.path} (Original)`);
-                    const patchedUri = vscode.Uri.parse(`untitled:${file.path} (Suggested Fix)`);
+                    const lang = this.detectLanguage(file.path);
+                    const hasOriginal = file.original && file.original.trim().length > 0;
+                    const hasPatched = file.patched && file.patched.trim().length > 0;
 
-                    // Create virtual documents and show diff
-                    const originalDoc = await vscode.workspace.openTextDocument({ content: file.original || '// No original content available', language: this.detectLanguage(file.path) });
-                    const patchedDoc = await vscode.workspace.openTextDocument({ content: file.patched || '// No patch content available', language: this.detectLanguage(file.path) });
+                    if (!hasPatched) { continue; } // Skip empty patches
 
-                    await vscode.commands.executeCommand('vscode.diff',
-                        originalDoc.uri,
-                        patchedDoc.uri,
-                        `Fix: ${file.description || file.path}`,
-                        { preview: false },
-                    );
+                    if (hasOriginal) {
+                        // Modification — show diff between original and patched
+                        const originalDoc = await vscode.workspace.openTextDocument({ content: file.original, language: lang });
+                        const patchedDoc = await vscode.workspace.openTextDocument({ content: file.patched, language: lang });
+                        await vscode.commands.executeCommand('vscode.diff',
+                            originalDoc.uri, patchedDoc.uri,
+                            `Fix: ${file.description || file.path}`,
+                            { preview: false },
+                        );
+                    } else {
+                        // New file — just open the patched content
+                        const doc = await vscode.workspace.openTextDocument({ content: file.patched, language: lang });
+                        await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+                    }
                     appliedCount++;
-                } catch (fileErr) {
-                    // Skip individual file errors
+                    // Small delay between tabs to avoid overwhelming VS Code
+                    await new Promise(r => setTimeout(r, 300));
+                } catch (fileErr: any) {
+                    console.error(`TraceAI: Failed to open patch for ${file.path}:`, fileErr?.message || fileErr);
                 }
             }
 
