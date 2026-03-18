@@ -97,7 +97,7 @@ export class ReportWebview {
                 vscode.ViewColumn.Beside,
                 {
                     enableScripts: true,
-                    retainContextWhenHidden: true,
+                    retainContextWhenHidden: false,
                     localResourceRoots: [this.extensionUri],
                     enableFindWidget: true,
                 },

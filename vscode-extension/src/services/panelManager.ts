@@ -43,7 +43,7 @@ export class PanelManager {
             vscode.ViewColumn.Active,
             {
                 enableScripts: true,
-                retainContextWhenHidden: true,
+                retainContextWhenHidden: false,
                 localResourceRoots: [this.extensionUri],
                 enableFindWidget: true,
             },
@@ -124,7 +124,7 @@ export class PanelManager {
                 vscode.ViewColumn.Active,
                 {
                     enableScripts: true,
-                    retainContextWhenHidden: true,
+                    retainContextWhenHidden: false,
                     localResourceRoots: [this.extensionUri],
                     enableFindWidget: true,
                 },
