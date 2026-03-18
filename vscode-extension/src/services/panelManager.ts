@@ -147,8 +147,15 @@ export class PanelManager {
 
     private getProgressHtml(taskId: string, taskTitle: string): string {
         const nonce = this.getNonce();
-        const stages = [
-            'Loading ticket', 'Running skills', 'Aggregating evidence',
+        // These MUST match the stage keys and labels in extension.ts investigateTask()
+        const stageKeys = [
+            'loading_ticket', 'classifying', 'parallel_analysis',
+            'deep_investigation', 'sql_intelligence', 'evidence_aggregation',
+            'building_graph', 'building_context', 'ai_reasoning', 'generating_report',
+        ];
+        const stageNames = [
+            'Loading ticket', 'Classifying task', 'Multi-layer analysis',
+            'Deep evidence collection', 'SQL intelligence', 'Aggregating evidence',
             'Building graph', 'Building context', 'AI reasoning', 'Generating report',
         ];
 
@@ -172,6 +179,7 @@ export class PanelManager {
         .icon { width: 20px; text-align: center; }
         .spinner { display: inline-block; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        .elapsed { margin-top: 16px; font-size: 0.85em; opacity: 0.5; }
         .banner { margin-top: 16px; padding: 10px 14px; border-radius: 6px; display: none; font-weight: 500; }
         .banner.show { display: block; }
         .banner.complete { background: rgba(76,175,80,0.1); color: #4caf50; }
@@ -184,16 +192,26 @@ export class PanelManager {
     <h1>Investigating: ${this.esc(taskTitle)}</h1>
     <div class="subtitle">Task ${this.esc(taskId)}</div>
     <ul class="stages" id="stageList">
-        ${stages.map(s => `<li class="stage pending"><span class="icon">&#9675;</span> ${s}</li>`).join('\n        ')}
+        ${stageNames.map(s => `<li class="stage pending"><span class="icon">&#9675;</span> ${s}</li>`).join('\n        ')}
     </ul>
+    <div class="elapsed" id="elapsed"></div>
     <div class="banner" id="banner"></div>
     <div class="log-area" id="logs"></div>
     <script nonce="${nonce}">
         (function() {
             var vscode = acquireVsCodeApi();
-            var stageNames = ${JSON.stringify(stages)};
-            var stageKeys = ['loading_ticket','skills_execution','evidence_aggregation',
-                'building_graph','building_context','ai_reasoning','generating_report'];
+            var stageNames = ${JSON.stringify(stageNames)};
+            var stageKeys = ${JSON.stringify(stageKeys)};
+            var startTime = Date.now();
+
+            // Update elapsed timer every second
+            setInterval(function() {
+                var el = document.getElementById('elapsed');
+                if (el) {
+                    var secs = Math.floor((Date.now() - startTime) / 1000);
+                    el.textContent = 'Elapsed: ' + secs + 's';
+                }
+            }, 1000);
 
             window.addEventListener('message', function(e) {
                 var msg = e.data;

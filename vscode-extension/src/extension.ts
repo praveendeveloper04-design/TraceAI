@@ -297,53 +297,67 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
                 });
 
                 // Animate progress stages while the API call runs
+                // Stage keys MUST match panelManager.ts getProgressHtml() stageKeys
                 const stages = [
                     { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
                     { key: 'classifying', label: 'Classifying task...', ms: 400 },
-                    { key: 'parallel_analysis', label: 'Running multi-layer analysis...', ms: 1000 },
+                    { key: 'parallel_analysis', label: 'Multi-layer analysis...', ms: 1000 },
                     { key: 'deep_investigation', label: 'Deep evidence collection...', ms: 1500 },
                     { key: 'sql_intelligence', label: 'SQL intelligence...', ms: 800 },
                     { key: 'evidence_aggregation', label: 'Aggregating evidence...', ms: 600 },
                     { key: 'building_graph', label: 'Building graph...', ms: 500 },
                     { key: 'building_context', label: 'Building context...', ms: 500 },
-                    { key: 'ai_reasoning', label: 'AI reasoning...', ms: 0 },
+                    { key: 'ai_reasoning', label: 'AI reasoning (this may take a minute)...', ms: -1 },
                 ];
+
+                let apiDone = false;
 
                 const advanceStages = async () => {
                     for (const s of stages) {
-                        if (cancelled) { return; }
+                        if (cancelled || apiDone) { return; }
                         progress.report({ message: s.label, increment: 10 });
                         panelManager.updateProgress(taskId, s.key, s.label);
-                        if (s.ms > 0) { await new Promise(r => setTimeout(r, s.ms)); }
-                        else { break; }
+                        if (s.ms > 0) {
+                            await new Promise(r => setTimeout(r, s.ms));
+                        } else {
+                            // Last stage (-1): keep spinner alive until API completes
+                            while (!apiDone && !cancelled) {
+                                await new Promise(r => setTimeout(r, 2000));
+                            }
+                            return;
+                        }
                     }
                 };
 
                 const stagePromise = advanceStages();
                 const apiPromise = apiService.investigate(taskId);
 
-                await stagePromise;
-                if (cancelled) { return; }
-
+                // Wait for API to finish (stages keep animating in parallel)
+                let report: any;
                 try {
-                    const report = await apiPromise;
-                    if (cancelled) { return; }
-
-                    panelManager.updateProgress(taskId, 'generating_report', 'Generating report...');
-                    await new Promise(r => setTimeout(r, 400));
-                    panelManager.updateProgress(taskId, 'complete', 'Investigation complete!', 'complete');
-                    await new Promise(r => setTimeout(r, 600));
-
-                    panelManager.showReport(taskId, report);
-
-                    if (report.status === 'completed') {
-                        vscode.window.showInformationMessage(`Investigation complete: ${report.findings?.length || 0} finding(s)`);
-                    }
+                    report = await apiPromise;
                 } catch (err) {
+                    apiDone = true;
                     if (!cancelled) {
                         panelManager.updateProgress(taskId, 'error', `Failed: ${err}`, 'error');
                         vscode.window.showErrorMessage(`Investigation failed: ${err}`);
                     }
+                    return;
+                }
+
+                apiDone = true;
+                await stagePromise; // Let animation finish cleanly
+                if (cancelled) { return; }
+
+                panelManager.updateProgress(taskId, 'generating_report', 'Generating report...');
+                await new Promise(r => setTimeout(r, 400));
+                panelManager.updateProgress(taskId, 'complete', 'Investigation complete!', 'complete');
+                await new Promise(r => setTimeout(r, 600));
+
+                panelManager.showReport(taskId, report);
+
+                if (report.status === 'completed') {
+                    vscode.window.showInformationMessage(`Investigation complete: ${report.findings?.length || 0} finding(s)`);
                 }
             },
         );
