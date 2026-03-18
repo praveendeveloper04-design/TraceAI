@@ -773,9 +773,13 @@ class InvestigationEngine:
 
                 async def _run_skill(s=skill):
                     return await s.run(task, skill_context, self.guard, connectors, graph)
+
+                # Skills that call external APIs need longer timeouts
+                skill_timeout = 60 if skill.name in ("ticket_context", "database_schema", "database_analysis") else 30
+
                 parallel.add_task(
                     f"skill_{skill.name}", _run_skill,
-                    timeout=30, priority=5,
+                    timeout=skill_timeout, priority=5,
                 )
 
             # Telemetry: log skill selection decision
