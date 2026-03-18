@@ -53,10 +53,13 @@ export class ServerManager {
      * Returns true if server is alive after this call.
      */
     async ensureRunning(): Promise<boolean> {
-        // 1. Check if already running
-        if (await this.isAlive()) {
-            this.log('Server already running.');
-            return true;
+        // 1. Check if already running (retry a few times for slow startup)
+        for (let i = 0; i < 3; i++) {
+            if (await this.isAlive()) {
+                this.log('Server already running.');
+                return true;
+            }
+            if (i < 2) { await new Promise(r => setTimeout(r, 2000)); }
         }
 
         // 2. Detect Python
@@ -92,7 +95,11 @@ export class ServerManager {
             this.log('Virtual environment exists.');
         }
 
-        // 5. Install backend dependencies
+        // 5. Install backend dependencies (skip if server came alive during setup)
+        if (await this.isAlive()) {
+            this.log('Server came alive during setup — skipping install.');
+            return true;
+        }
         const installed = await this.ensureBackendInstalled();
         if (!installed) {
             vscode.window.showErrorMessage(
