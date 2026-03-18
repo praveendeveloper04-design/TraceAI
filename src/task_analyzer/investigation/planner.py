@@ -46,6 +46,14 @@ STOP_WORDS = frozenset({
     "out", "off", "over", "under", "again", "further", "once",
     "able", "unable", "issue", "problem", "bug", "error", "fix",
     "please", "check", "update", "change", "add", "remove",
+    # Generic words that match too many code classes
+    "open", "close", "list", "item", "data", "info", "type", "name",
+    "value", "result", "status", "state", "event", "action", "task",
+    "follow", "prod", "test", "main", "base", "core", "common",
+    "even", "expected", "currently", "still", "working", "show",
+    "showing", "display", "page", "view", "form", "button", "click",
+    "ability", "inability", "feature", "details", "summary",
+    "maintenance", "deployment", "configuration", "setting",
 })
 
 
@@ -90,13 +98,17 @@ class EntityExtractor:
         words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9]*\b", text)
         for word in words:
             lower = word.lower()
+            is_acronym = word.isupper() and len(word) >= 3  # ITM, OVC, API
+            min_len = 3 if is_acronym else 4  # Acronyms can be 3 chars
             if (
                 lower not in seen
                 and lower not in STOP_WORDS
-                and len(lower) > 2
+                and len(lower) >= min_len
                 and not lower.isdigit()
+                and not re.match(r"^[a-z]{1,2}\d+", lower)  # Skip ticket refs like cr84899
+                and not re.match(r"^\d+[a-z]*$", lower)  # Skip numeric refs like 07344649
             ):
-                entities.append(lower)
+                entities.append(word if is_acronym else lower)
                 seen.add(lower)
 
         # 4. Extract quoted strings

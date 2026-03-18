@@ -643,7 +643,7 @@ export class PanelManager {
 
         ${changes.length ? `<div class="divider">Changes &amp; Impact (${changes.length})</div>${changesHtml}` : ''}
 
-        ${allFiles.length ? `<div class="files-section"><div class="divider">Affected Files (${allFiles.length})</div>${filesHtml}</div>` : ''}
+        ${allFiles.length ? `<div class="files-section"><div class="divider">Files to Modify (${allFiles.length})</div>${filesHtml}</div>` : ''}
 
         <div class="actions">
             <button class="btn" id="rerunBtn">

@@ -147,7 +147,7 @@ If you cannot find the root cause from the provided evidence:
     "recommendations": [
         "Actionable recommendation 1"
     ],
-    "affected_files": ["path/to/file.py"],
+    "affected_files": ["path/to/file.py -- ONLY files that NEED TO BE MODIFIED to fix this issue, NOT files you found during investigation"],
     "affected_services": ["service-name"]
 }}
 ```
