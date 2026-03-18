@@ -62,6 +62,8 @@ export class PanelManager {
         panel.webview.onDidReceiveMessage(async (msg) => {
             if (msg.command === 'rerun') {
                 vscode.commands.executeCommand('traceai.investigateFromId', msg.taskId);
+            } else if (msg.command === 'applyFixes') {
+                await this.handleApplyFixes(panel, msg.investigationId);
             }
         });
 
@@ -134,6 +136,8 @@ export class PanelManager {
             panel.webview.onDidReceiveMessage(async (msg) => {
                 if (msg.command === 'rerun') {
                     vscode.commands.executeCommand('traceai.investigateFromId', msg.taskId);
+                } else if (msg.command === 'applyFixes') {
+                    await this.handleApplyFixes(panel, msg.investigationId);
                 }
             });
 
@@ -141,6 +145,86 @@ export class PanelManager {
         } catch (error) {
             vscode.window.showErrorMessage(`Failed to load investigation: ${error}`);
         }
+    }
+
+    // ── Apply Fixes Handler ─────────────────────────────────────────────
+
+    private async handleApplyFixes(panel: vscode.WebviewPanel, investigationId: string): Promise<void> {
+        try {
+            // Get workspace path
+            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+            // Call the patch generation API
+            const patchResult = await this.apiService.generatePatch(investigationId, workspacePath);
+
+            if (patchResult.parse_error) {
+                panel.webview.postMessage({
+                    command: 'patchStatus',
+                    status: 'error',
+                    message: `Patch parsing failed: ${patchResult.parse_error}`,
+                });
+                return;
+            }
+
+            if (!patchResult.files || patchResult.files.length === 0) {
+                panel.webview.postMessage({
+                    command: 'patchStatus',
+                    status: 'error',
+                    message: 'Claude did not generate any file patches. The investigation may not have found specific code changes to suggest.',
+                });
+                return;
+            }
+
+            // Show each patch in a diff editor
+            let appliedCount = 0;
+            for (const file of patchResult.files) {
+                try {
+                    const originalUri = vscode.Uri.parse(`untitled:${file.path} (Original)`);
+                    const patchedUri = vscode.Uri.parse(`untitled:${file.path} (Suggested Fix)`);
+
+                    // Create virtual documents and show diff
+                    const originalDoc = await vscode.workspace.openTextDocument({ content: file.original || '// No original content available', language: this.detectLanguage(file.path) });
+                    const patchedDoc = await vscode.workspace.openTextDocument({ content: file.patched || '// No patch content available', language: this.detectLanguage(file.path) });
+
+                    await vscode.commands.executeCommand('vscode.diff',
+                        originalDoc.uri,
+                        patchedDoc.uri,
+                        `Fix: ${file.description || file.path}`,
+                        { preview: false },
+                    );
+                    appliedCount++;
+                } catch (fileErr) {
+                    // Skip individual file errors
+                }
+            }
+
+            panel.webview.postMessage({
+                command: 'patchStatus',
+                status: 'success',
+                message: `Generated ${appliedCount} fix(es) for: ${patchResult.task_title || 'investigation'}. Review the diff tabs to apply changes.`,
+            });
+
+            vscode.window.showInformationMessage(
+                `TraceAI: ${appliedCount} suggested fix(es) opened in diff view. Review and copy the changes you want to keep.`
+            );
+
+        } catch (error) {
+            panel.webview.postMessage({
+                command: 'patchStatus',
+                status: 'error',
+                message: `Failed to generate fixes: ${error}`,
+            });
+            vscode.window.showErrorMessage(`TraceAI: Failed to generate fixes: ${error}`);
+        }
+    }
+
+    private detectLanguage(filePath: string): string {
+        const ext = filePath.split('.').pop()?.toLowerCase() || '';
+        const map: Record<string, string> = {
+            'cs': 'csharp', 'py': 'python', 'ts': 'typescript', 'js': 'javascript',
+            'json': 'json', 'xml': 'xml', 'sql': 'sql', 'yaml': 'yaml', 'yml': 'yaml',
+        };
+        return map[ext] || 'plaintext';
     }
 
     // ── HTML Generators ──────────────────────────────────────────────────
@@ -308,6 +392,14 @@ code { background: var(--vscode-textCodeBlock-background); padding: 2px 6px; bor
 ul { padding-left: 18px; } li { margin-bottom: 3px; }
 .btn { padding: 8px 18px; border-radius: 4px; border: none; cursor: pointer; font-weight: 600; margin-right: 8px; margin-top: 12px; }
 .btn-rerun { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.btn-apply { background: #4caf50; color: #fff; }
+.btn-apply:hover { background: #43a047; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.patch-status { margin-top: 12px; padding: 10px 14px; border-radius: 6px; display: none; font-size: 0.9em; }
+.patch-status.show { display: block; }
+.patch-status.loading { background: rgba(33,150,243,0.1); color: #2196f3; }
+.patch-status.success { background: rgba(76,175,80,0.1); color: #4caf50; }
+.patch-status.error { background: rgba(244,67,54,0.1); color: #f44336; }
 </style></head><body>
 <h1>Investigation: ${this.esc(report.task_title || '')}</h1>
 <div class="status-bar">
@@ -324,14 +416,46 @@ ${recsHtml ? `<h2>Recommendations</h2><ul>${recsHtml}</ul>` : ''}
 ${report.error ? `<h2>Warnings</h2><div class="card" style="border-left:3px solid #ff9800;">${this.esc(report.error)}</div>` : ''}
 
 <button class="btn btn-rerun" id="rerunBtn">Re-run Investigation</button>
+<button class="btn btn-apply" id="applyBtn">Apply Fixes</button>
+<div class="patch-status" id="patchStatus"></div>
 
 <script nonce="${nonce}">
 (function() {
     var vscode = acquireVsCodeApi();
     var rawId = '${this.esc(report.task_id || '')}';
     var taskId = rawId.replace(/^ado-/, '');
+    var investigationId = '${this.esc(report.id || '')}';
+
     document.getElementById('rerunBtn').addEventListener('click', function() {
         vscode.postMessage({ command: 'rerun', taskId: taskId });
+    });
+
+    document.getElementById('applyBtn').addEventListener('click', function() {
+        var btn = document.getElementById('applyBtn');
+        var status = document.getElementById('patchStatus');
+        btn.disabled = true;
+        btn.textContent = 'Generating fixes...';
+        status.className = 'patch-status show loading';
+        status.textContent = 'Asking Claude to generate code fixes based on investigation findings...';
+        vscode.postMessage({ command: 'applyFixes', investigationId: investigationId, taskId: taskId });
+    });
+
+    window.addEventListener('message', function(e) {
+        var msg = e.data;
+        var btn = document.getElementById('applyBtn');
+        var status = document.getElementById('patchStatus');
+        if (msg.command === 'patchStatus') {
+            if (msg.status === 'success') {
+                btn.textContent = 'Fixes Applied';
+                status.className = 'patch-status show success';
+                status.textContent = msg.message || 'Patches generated and opened in diff view.';
+            } else if (msg.status === 'error') {
+                btn.disabled = false;
+                btn.textContent = 'Apply Fixes';
+                status.className = 'patch-status show error';
+                status.textContent = msg.message || 'Failed to generate fixes.';
+            }
+        }
     });
 })();
 </script></body></html>`;
