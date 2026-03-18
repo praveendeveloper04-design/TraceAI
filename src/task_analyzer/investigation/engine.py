@@ -700,57 +700,55 @@ class InvestigationEngine:
             parallel = ParallelAnalysisEngine()
             parallel.set_progress_callback(progress_callback)
 
-            # Get repo paths for code flow analysis
+            # Get repo paths and entities for agents
             repo_paths = []
             for p in self.profiles:
                 rp = getattr(p, "repo_path", None)
                 if rp and Path(rp).exists():
                     repo_paths.append(Path(rp))
 
-            # Get entities for analysis
             entities = []
             if investigation_plan:
                 entities = investigation_plan.entities
             elif classification:
                 entities = classification.priority_entities
 
-            # Task A: Code flow analysis (CPU-bound, runs in thread pool)
-            if repo_paths and entities:
-                async def _run_code_flow():
-                    return self.code_flow_engine.analyze(entities, repo_paths)
-                parallel.add_task(
-                    "code_flow_analysis", _run_code_flow,
-                    timeout=30, priority=1,
-                )
-
-            # Task B: Deep investigation (I/O-bound, async)
             connectors = self.registry.get_all_instances()
-            async def _run_deep_investigation():
-                from task_analyzer.investigation.deep_investigator import DeepInvestigator
-                deep = DeepInvestigator(
-                    profiles=self.profiles,
-                    connectors=connectors,
-                    plan=investigation_plan,
-                )
-                return await deep.collect(
-                    task.title, task.description,
-                    progress_callback=progress_callback,
-                )
-            parallel.add_task(
-                "deep_investigation", _run_deep_investigation,
-                timeout=60, priority=2,
-            )
 
-            # Task C: Run available skills in parallel (filtered by classification)
+            # ── Agent-based orchestration ────────────────────────────────
+            from task_analyzer.investigation.agents import (
+                EntityExtractionAgent, RepoScanAgent, SchemaDiscoveryAgent,
+                CodeFlowAgent, TicketContextAgent, CodeDeepDiveAgent,
+                SQLIntelligenceAgent, EvidenceMergeAgent,
+            )
+            from task_analyzer.investigation.parallel_engine import AgentOrchestrator
+
+            orchestrator = AgentOrchestrator(parallel)
+
+            # Wave 1: Independent agents (no dependencies)
+            orchestrator.register_agent(EntityExtractionAgent())
+            if repo_paths and entities:
+                orchestrator.register_agent(RepoScanAgent())
+                orchestrator.register_agent(CodeFlowAgent())
+            orchestrator.register_agent(SchemaDiscoveryAgent())
+            orchestrator.register_agent(TicketContextAgent())
+
+            # Wave 2: Dependent agents
+            if repo_paths:
+                orchestrator.register_agent(CodeDeepDiveAgent())
+            orchestrator.register_agent(SQLIntelligenceAgent())
+
+            # Wave 3: Final merge
+            orchestrator.register_agent(EvidenceMergeAgent())
+
+            # Also run remaining skills alongside agents
             available_skills = self.skill_registry.list_available(connectors)
             skill_context = {"profiles": self.profiles}
             if investigation_plan:
                 skill_context["investigation_plan"] = investigation_plan
 
-            # Dynamic skill orchestration: only run skills suggested by classification
             suggested_skill_names = set()
             if investigation_plan and investigation_plan.skills:
-                # Map skill class names to registry names
                 skill_name_map = {
                     "RepoAnalysisSkill": "repo_analysis",
                     "TicketContextSkill": "ticket_context",
@@ -762,48 +760,57 @@ class InvestigationEngine:
                     "LogAnalysisSkill": "log_analysis",
                 }
                 for s in investigation_plan.skills:
-                    mapped = skill_name_map.get(s, s)
-                    suggested_skill_names.add(mapped)
+                    suggested_skill_names.add(skill_name_map.get(s, s))
+
+            # Skills already handled by agents — skip duplicates
+            agent_handled = {"ticket_context", "database_schema", "sql_query", "code_analysis"}
 
             for skill in available_skills:
-                # Skip skills not suggested by classification (if classification provided)
-                if suggested_skill_names and skill.name not in suggested_skill_names:
-                    logger.debug("skill_skipped_by_classification", skill=skill.name)
+                if skill.name in agent_handled:
                     continue
-
+                if suggested_skill_names and skill.name not in suggested_skill_names:
+                    continue
                 async def _run_skill(s=skill):
                     return await s.run(task, skill_context, self.guard, connectors, graph)
+                parallel.add_task(f"skill_{skill.name}", _run_skill, timeout=60, priority=5)
 
-                # Skills that call external APIs need longer timeouts
-                skill_timeout = 60 if skill.name in ("ticket_context", "database_schema", "database_analysis") else 30
+            # Build agent tasks and execute all in parallel waves
+            common_kwargs = {
+                "task_title": task.title,
+                "task_description": task.description or "",
+                "entities": entities,
+                "profiles": self.profiles,
+                "connectors": connectors,
+                "plan": investigation_plan,
+                "classification": classification,
+                "progress_callback": progress_callback,
+                "_task_obj": task,
+            }
+            orchestrator.build_tasks(**common_kwargs)
 
-                parallel.add_task(
-                    f"skill_{skill.name}", _run_skill,
-                    timeout=skill_timeout, priority=5,
-                )
-
-            # Telemetry: log skill selection decision
-            selected_skills = []
-            skipped_skills = []
-            for skill in available_skills:
-                if suggested_skill_names and skill.name not in suggested_skill_names:
-                    skipped_skills.append(skill.name)
-                else:
-                    selected_skills.append(skill.name)
-            if suggested_skill_names:
-                self.audit.log_skills_selected(
-                    task.id,
-                    selected=selected_skills,
-                    skipped=skipped_skills,
-                    reason=f"classification={classification.category}" if classification else "no_classification",
-                )
-
-            # Execute all tasks in parallel
             analysis_result = await parallel.execute()
 
-            # Extract results
-            deep_evidence = analysis_result.deep_evidence
-            layer_map = analysis_result.layer_map
+            # Extract results from agent context
+            merged = orchestrator.context.merged_evidence
+            if merged:
+                deep_evidence = {
+                    "code_files": merged.code_files,
+                    "code_flows": merged.code_flows,
+                    "sql_tables": merged.sql_tables,
+                    "sql_schema": merged.sql_schema,
+                    "repo_search_results": merged.repo_search_results,
+                    "entities": merged.entities,
+                    "quality": merged.quality,
+                    "loops_completed": merged.loops_completed,
+                    "tenant_db": merged.tenant_db,
+                }
+                layer_map = merged.layer_map
+                sql_results = merged.query_results
+            else:
+                deep_evidence = analysis_result.deep_evidence
+                layer_map = analysis_result.layer_map
+                sql_results = []
+
             skill_results = analysis_result.skill_results
 
             # Log parallel execution metrics
@@ -828,80 +835,9 @@ class InvestigationEngine:
                 ),
             ))
 
-            # Step 2: SQL Intelligence — generate and execute smart queries
-            sql_results = []
-            if investigation_plan and investigation_plan.tables:
-                await _emit("sql_intelligence", "Running SQL intelligence...")
-                try:
-                    # Get schema info from deep evidence or skill results
-                    schema_info = {}
-                    if deep_evidence and deep_evidence.get("sql_schema"):
-                        for s in deep_evidence["sql_schema"]:
-                            schema_info[s["table"]] = s.get("columns", [])
-                    if "database_schema" in skill_results:
-                        for t_info in skill_results["database_schema"].get("tables", []):
-                            if t_info.get("name") and t_info.get("columns"):
-                                schema_info[t_info["name"]] = t_info["columns"]
-
-                    # Get code-discovered tables from layer map
-                    code_tables = []
-                    if layer_map:
-                        code_tables = layer_map.db_tables_referenced
-
-                    # Generate smart queries
-                    queries = self.sql_intelligence.generate_queries(
-                        tables=investigation_plan.tables,
-                        schema_info=schema_info,
-                        task_category=classification.category if classification else "unknown",
-                        entities=entities,
-                        code_tables=code_tables,
-                    )
-
-                    # Execute queries
-                    db_connector = None
-                    for cn, co in connectors.items():
-                        ct = getattr(co, "connector_type", None)
-                        if ct and hasattr(ct, "value") and ct.value == "sql_database":
-                            db_connector = co
-                            break
-
-                    if db_connector and queries:
-                        sql_results = self.sql_intelligence.execute_queries(
-                            db_connector, queries, max_queries=12,
-                        )
-                        logger.info(
-                            "sql_intelligence_complete",
-                            queries_generated=len(queries),
-                            queries_executed=len(sql_results),
-                        )
-
-                except Exception as exc:
-                    logger.warning("sql_intelligence_failed", error=str(exc)[:200])
-
-            # Step 2b: Build SQL queries from code-discovered tables (fallback)
-            if investigation_plan and investigation_plan.tables:
-                if "code_analysis" in skill_results:
-                    code_tables = skill_results["code_analysis"].get("code_tables", [])
-                    if code_tables:
-                        try:
-                            from task_analyzer.investigation.planner import SchemaDiscovery
-                            db_conn = None
-                            for cn, co in self.registry.get_all_instances().items():
-                                ct = getattr(co, "connector_type", None)
-                                if ct and hasattr(ct, "value") and ct.value == "sql_database":
-                                    db_conn = co
-                                    break
-                            if db_conn:
-                                sd = SchemaDiscovery()
-                                schema_tables = sd.discover_tables(db_conn, investigation_plan.tenant_db)
-                                schema_simple = {t.split(".")[-1].lower() for t in schema_tables}
-                                valid_code_tables = [t for t in code_tables if t.lower() in schema_simple]
-                                if valid_code_tables:
-                                    investigation_plan.code_tables = valid_code_tables
-                                    investigation_plan.build_queries_from_code_tables(schema_tables)
-                                    logger.info("queries_from_code_tables", tables=valid_code_tables[:5])
-                        except Exception as exc:
-                            logger.debug("query_rebuild_failed", error=str(exc))
+            # SQL Intelligence and code-table queries are now handled by
+            # SQLIntelligenceAgent and CodeDeepDiveAgent in the parallel waves.
+            # sql_results is already populated from the agent context above.
 
             # Step 3: Aggregate evidence and rank root causes
             await _emit("evidence_aggregation", "Aggregating evidence...")

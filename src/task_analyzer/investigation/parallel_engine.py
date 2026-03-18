@@ -369,3 +369,47 @@ class ParallelAnalysisEngine:
                 await self._progress_callback(stage, message)
             except Exception:
                 pass
+
+
+# ── Agent Orchestrator ───────────────────────────────────────────────────────
+
+class AgentOrchestrator:
+    """
+    Orchestrates investigation agents through the ParallelAnalysisEngine.
+
+    Translates agent dependencies into ParallelTask.depends_on and
+    manages the AgentContext for inter-agent communication.
+    """
+
+    def __init__(self, parallel_engine: ParallelAnalysisEngine) -> None:
+        self._engine = parallel_engine
+        self._agents: dict[str, Any] = {}
+
+        from task_analyzer.investigation.agents.context import AgentContext
+        self._ctx = AgentContext()
+
+    @property
+    def context(self):
+        return self._ctx
+
+    def register_agent(self, agent) -> None:
+        """Register an agent for orchestrated execution."""
+        self._agents[agent.name] = agent
+
+    def build_tasks(self, **common_kwargs) -> None:
+        """Convert registered agents into ParallelTasks with dependency wiring."""
+        for agent in self._agents.values():
+            async def _run(a=agent, kw=common_kwargs):
+                result = await a.execute_safe(self._ctx, **kw)
+                if result is not None:
+                    self._ctx.set(a.name, result)
+                return result
+
+            self._engine.add_task(
+                name=f"agent_{agent.name}",
+                coroutine_factory=_run,
+                timeout=agent.timeout,
+                depends_on=[f"agent_{d}" for d in agent.depends_on],
+                priority=agent.priority,
+            )
+
