@@ -456,50 +456,47 @@ export class PanelManager {
         const isCompleted = report.status === 'completed';
         const isFailed = report.status === 'failed';
         const statusColor = isCompleted ? '#3fb950' : isFailed ? '#f85149' : '#d29922';
-        const statusLabel = (report.status || 'unknown').toUpperCase();
-        const findingsCount = report.findings?.length || 0;
 
-        const confidenceColor = (c: number) => c >= 0.7 ? '#3fb950' : c >= 0.4 ? '#d29922' : '#8b949e';
-        const categoryIcon = (cat: string) => {
-            if (cat.includes('verified')) return 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z';
-            if (cat.includes('hypothesis')) return 'M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01';
-            if (cat.includes('insufficient')) return 'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z';
-            return 'M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z';
-        };
+        // Determine type: Bug or Feature
+        const isBug = (report.findings || []).some(f =>
+            f.category.includes('verified') || f.category.includes('root_cause')
+        ) || (report.root_cause || '').toLowerCase().includes('bug');
+        const taskType = isBug ? 'Bug' : 'Feature';
+        const typeColor = isBug ? '#f85149' : '#58a6ff';
 
-        const findingsHtml = (report.findings || []).map((f, i) => {
-            const pct = Math.round(f.confidence * 100);
-            const color = confidenceColor(f.confidence);
-            return `
-            <div class="finding-card">
-                <div class="finding-header">
-                    <div class="finding-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="${categoryIcon(f.category)}"/></svg>
-                    </div>
-                    <div class="finding-title-area">
-                        <div class="finding-title">${this.esc(f.title)}</div>
-                        <div class="finding-meta">
-                            <span class="tag">${this.esc(f.category).replace(/_/g, ' ')}</span>
-                            <span class="confidence" style="color:${color}">${pct}%</span>
-                        </div>
-                    </div>
+        // Build concise summary (first 2 sentences max)
+        const rawSummary = report.summary || '';
+        const sentences = rawSummary.split(/(?<=[.!?])\s+/).filter(s => s.trim());
+        const shortSummary = sentences.slice(0, 2).join(' ');
+
+        // Affected areas: group by file path prefix
+        const affectedFiles = report.affected_files || [];
+        const fileRefs = (report.findings || []).flatMap(f => f.file_references || []);
+        const allFiles = [...new Set([...affectedFiles, ...fileRefs])].filter(f => f);
+
+        // Build change items from findings — only verified + hypothesis with confidence > 30%
+        const changes = (report.findings || [])
+            .filter(f => f.confidence >= 0.3 && !f.category.includes('insufficient'))
+            .map(f => {
+                const pct = Math.round(f.confidence * 100);
+                const isVerified = f.category.includes('verified');
+                return { title: f.title, confidence: pct, verified: isVerified, description: f.description, files: f.file_references || [] };
+            });
+
+        const changesHtml = changes.map(c => `
+            <div class="change-row">
+                <div class="change-indicator ${c.verified ? 'verified' : 'hypothesis'}"></div>
+                <div class="change-content">
+                    <div class="change-title">${this.esc(c.title)}</div>
+                    <div class="change-desc">${this.esc(c.description)}</div>
+                    ${c.files.length ? '<div class="change-files">' + c.files.map(f => '<code>' + this.esc(f) + '</code>').join(' ') + '</div>' : ''}
                 </div>
-                <div class="finding-body">${this.esc(f.description)}</div>
-                ${f.evidence?.length ? '<div class="finding-evidence">' + f.evidence.map(e => '<div class="evidence-item">' + this.esc(e) + '</div>').join('') + '</div>' : ''}
-            </div>`;
-        }).join('');
+                <div class="change-conf ${c.verified ? 'high' : 'med'}">${c.confidence}%</div>
+            </div>`).join('');
 
-        const recsHtml = (report.recommendations || []).map(r =>
-            `<div class="rec-item"><svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><path d="M9 5l7 7-7 7"/></svg><span>${this.esc(r)}</span></div>`
+        const filesHtml = allFiles.slice(0, 12).map(f =>
+            `<div class="file-row"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="14" height="14"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg><code>${this.esc(f)}</code></div>`
         ).join('');
-
-        const hypothesesHtml = (report.root_cause_hypotheses || []).map((h, i) => {
-            const pct = Math.round((h.confidence || 0) * 100);
-            return `<div class="hypothesis-card">
-                <div class="hypothesis-header"><span class="hypothesis-num">#${i + 1}</span><span class="confidence" style="color:var(--warn)">${pct}%</span></div>
-                <div class="hypothesis-text">${this.esc(h.description)}</div>
-            </div>`;
-        }).join('');
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -515,143 +512,117 @@ export class PanelManager {
             --surface: var(--vscode-editorWidget-background, #161b22);
             --border: var(--vscode-panel-border, #30363d);
             --accent: #58a6ff;
-            --accent-dim: rgba(88,166,255,0.1);
+            --accent-dim: rgba(88,166,255,0.08);
             --success: #3fb950;
-            --success-dim: rgba(63,185,80,0.1);
+            --success-dim: rgba(63,185,80,0.08);
             --warn: #d29922;
-            --warn-dim: rgba(210,153,34,0.1);
             --error: #f85149;
-            --error-dim: rgba(248,81,73,0.1);
+            --error-dim: rgba(248,81,73,0.08);
             --muted: var(--vscode-descriptionForeground, #8b949e);
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
-            color: var(--fg); background: var(--bg);
-            line-height: 1.6; padding: 0;
+            color: var(--fg); background: var(--bg); line-height: 1.5; padding: 0;
         }
-        .container { max-width: 820px; margin: 0 auto; padding: 36px 32px 60px; }
+        .container { max-width: 760px; margin: 0 auto; padding: 32px 28px 48px; }
 
-        /* Header */
-        .report-header { margin-bottom: 28px; }
-        .header-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-        .header-label {
+        /* Top bar */
+        .top-bar {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .type-chip {
             display: inline-flex; align-items: center; gap: 6px;
-            font-size: 10px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase;
-            color: var(--accent);
+            padding: 5px 14px; border-radius: 6px; font-size: 11px; font-weight: 700;
+            letter-spacing: 0.8px; text-transform: uppercase;
+            background: ${isBug ? 'var(--error-dim)' : 'var(--accent-dim)'};
+            color: ${typeColor};
         }
-        .status-chip {
-            display: inline-flex; align-items: center; gap: 5px;
-            padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 600;
+        .type-dot { width: 7px; height: 7px; border-radius: 50%; background: ${typeColor}; }
+        .status-pill {
+            font-size: 11px; font-weight: 600; color: ${statusColor};
             letter-spacing: 0.5px; text-transform: uppercase;
-            background: ${isCompleted ? 'var(--success-dim)' : isFailed ? 'var(--error-dim)' : 'var(--warn-dim)'};
-            color: ${statusColor};
-        }
-        .status-dot { width: 6px; height: 6px; border-radius: 50%; background: ${statusColor}; }
-        .report-header h1 { font-size: 22px; font-weight: 600; line-height: 1.3; margin-bottom: 8px; }
-        .report-meta { font-size: 12px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
-        .report-meta span { display: flex; align-items: center; gap: 4px; }
-
-        /* Stats bar */
-        .stats-bar {
-            display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
-            margin-bottom: 28px;
-        }
-        .stat-card {
-            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-            padding: 14px 16px; text-align: center;
-        }
-        .stat-value { font-size: 24px; font-weight: 700; color: var(--fg); font-variant-numeric: tabular-nums; }
-        .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-top: 2px; }
-
-        /* Section headers */
-        .section { margin-bottom: 24px; }
-        .section-header {
-            font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
-            color: var(--muted); margin-bottom: 12px; padding-bottom: 8px;
-            border-bottom: 1px solid var(--border);
         }
 
-        /* Cards */
-        .summary-card {
-            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-            padding: 18px 20px; font-size: 14px; line-height: 1.7;
-        }
-        .root-cause-card {
-            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-            padding: 18px 20px; font-size: 14px; line-height: 1.7;
-            border-left: 3px solid var(--error);
+        /* Title */
+        .title { font-size: 18px; font-weight: 600; line-height: 1.35; margin-bottom: 6px; }
+        .meta { font-size: 11px; color: var(--muted); margin-bottom: 24px; }
+
+        /* Summary */
+        .summary {
+            font-size: 13.5px; line-height: 1.7; color: var(--fg);
+            padding: 16px 18px; background: var(--surface);
+            border: 1px solid var(--border); border-radius: 8px;
+            margin-bottom: 24px;
         }
 
-        /* Findings */
-        .finding-card {
-            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-            padding: 16px 18px; margin-bottom: 10px;
-            transition: border-color 0.2s;
+        /* Divider label */
+        .divider {
+            font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;
+            color: var(--muted); margin-bottom: 12px; margin-top: 4px;
         }
-        .finding-card:hover { border-color: var(--accent); }
-        .finding-header { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 10px; }
-        .finding-icon { width: 28px; height: 28px; flex-shrink: 0; padding-top: 2px; }
-        .finding-icon svg { width: 20px; height: 20px; }
-        .finding-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
-        .finding-meta { display: flex; gap: 8px; align-items: center; }
-        .tag {
-            font-size: 10px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;
-            padding: 2px 8px; border-radius: 4px;
-            background: var(--accent-dim); color: var(--accent);
+
+        /* Changes */
+        .change-row {
+            display: flex; align-items: flex-start; gap: 12px;
+            padding: 12px 14px; margin-bottom: 4px; border-radius: 8px;
+            border: 1px solid transparent; transition: all 0.15s;
         }
-        .confidence { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
-        .finding-body { font-size: 13px; color: var(--muted); line-height: 1.6; margin-left: 40px; }
-        .finding-evidence {
-            margin: 10px 0 0 40px; padding: 10px 14px;
-            background: var(--bg); border-radius: 6px; border: 1px solid var(--border);
+        .change-row:hover { background: var(--surface); border-color: var(--border); }
+        .change-indicator {
+            width: 3px; min-height: 32px; border-radius: 2px; flex-shrink: 0; margin-top: 2px;
         }
-        .evidence-item {
-            font-size: 12px; color: var(--muted); padding: 3px 0;
+        .change-indicator.verified { background: var(--success); }
+        .change-indicator.hypothesis { background: var(--warn); }
+        .change-content { flex: 1; min-width: 0; }
+        .change-title { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+        .change-desc { font-size: 12px; color: var(--muted); line-height: 1.5; }
+        .change-files { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+        .change-files code {
+            font-size: 11px; padding: 1px 6px; border-radius: 3px;
+            background: var(--bg); border: 1px solid var(--border);
             font-family: var(--vscode-editor-font-family, monospace);
+            color: var(--muted);
         }
-
-        /* Hypotheses */
-        .hypothesis-card {
-            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-            padding: 14px 18px; margin-bottom: 8px; border-left: 3px solid var(--warn);
+        .change-conf {
+            font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
+            flex-shrink: 0; padding-top: 2px;
         }
-        .hypothesis-header { display: flex; justify-content: space-between; margin-bottom: 6px; }
-        .hypothesis-num { font-size: 11px; font-weight: 700; color: var(--warn); }
-        .hypothesis-text { font-size: 13px; line-height: 1.6; }
+        .change-conf.high { color: var(--success); }
+        .change-conf.med { color: var(--warn); }
 
-        /* Recommendations */
-        .rec-item {
-            display: flex; align-items: flex-start; gap: 8px; padding: 6px 0;
-            font-size: 13px;
+        /* Files */
+        .files-section { margin-top: 24px; }
+        .file-row {
+            display: flex; align-items: center; gap: 8px; padding: 4px 0;
+            font-size: 12px; color: var(--muted);
         }
-        .rec-item svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 3px; }
-
-        /* Warning card */
-        .warning-card {
-            background: var(--warn-dim); border: 1px solid rgba(210,153,34,0.2); border-radius: 10px;
-            padding: 14px 18px; font-size: 13px; color: var(--warn);
+        .file-row code {
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: 12px; color: var(--fg);
         }
+        .file-row svg { flex-shrink: 0; stroke: var(--muted); }
 
-        /* Action buttons */
-        .actions { display: flex; gap: 10px; margin-top: 28px; flex-wrap: wrap; }
+        /* Actions */
+        .actions {
+            display: flex; gap: 8px; margin-top: 28px;
+            padding-top: 20px; border-top: 1px solid var(--border);
+        }
         .btn {
             display: inline-flex; align-items: center; gap: 6px;
-            padding: 10px 20px; border-radius: 8px; border: 1px solid var(--border);
-            cursor: pointer; font-size: 13px; font-weight: 600;
-            background: var(--surface); color: var(--fg);
-            transition: all 0.2s;
+            padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border);
+            cursor: pointer; font-size: 12px; font-weight: 600;
+            background: var(--surface); color: var(--fg); transition: all 0.15s;
         }
         .btn:hover { border-color: var(--accent); color: var(--accent); }
-        .btn svg { width: 16px; height: 16px; }
-        .btn-primary {
-            background: var(--accent); color: #fff; border-color: var(--accent);
-        }
+        .btn svg { width: 14px; height: 14px; }
+        .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
         .btn-primary:hover { background: #4c9aed; border-color: #4c9aed; color: #fff; }
         .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* Patch status */
-        .patch-status { margin-top: 12px; padding: 12px 16px; border-radius: 8px; display: none; font-size: 13px; }
+        .patch-status { margin-top: 10px; padding: 10px 14px; border-radius: 6px; display: none; font-size: 12px; }
         .patch-status.show { display: block; }
         .patch-status.loading { background: var(--accent-dim); color: var(--accent); }
         .patch-status.success { background: var(--success-dim); color: var(--success); }
@@ -660,38 +631,24 @@ export class PanelManager {
 </head>
 <body>
     <div class="container">
-        <div class="report-header">
-            <div class="header-top">
-                <div class="header-label">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-                    Investigation Report
-                </div>
-                <div class="status-chip"><span class="status-dot"></span>${statusLabel}</div>
-            </div>
-            <h1>${this.esc(report.task_title || '')}</h1>
-            <div class="report-meta">
-                <span>Task: ${this.esc(report.task_id || '')}</span>
-                <span>${report.started_at?.substring(0, 19).replace('T', ' ') || ''}</span>
-            </div>
+        <div class="top-bar">
+            <div class="type-chip"><span class="type-dot"></span>${taskType}</div>
+            <div class="status-pill">${(report.status || '').toUpperCase()}</div>
         </div>
 
-        <div class="stats-bar">
-            <div class="stat-card"><div class="stat-value">${findingsCount}</div><div class="stat-label">Findings</div></div>
-            <div class="stat-card"><div class="stat-value">${report.recommendations?.length || 0}</div><div class="stat-label">Recommendations</div></div>
-            <div class="stat-card"><div class="stat-value">${report.affected_files?.length || 0}</div><div class="stat-label">Files Affected</div></div>
-        </div>
+        <div class="title">${this.esc(report.task_title || '')}</div>
+        <div class="meta">Task ${this.esc(report.task_id || '')} &middot; ${report.started_at?.substring(0, 19).replace('T', ' ') || ''}</div>
 
-        ${report.summary ? `<div class="section"><div class="section-header">Summary</div><div class="summary-card">${this.esc(report.summary)}</div></div>` : ''}
-        ${report.root_cause ? `<div class="section"><div class="section-header">Root Cause</div><div class="root-cause-card">${this.esc(report.root_cause)}</div></div>` : ''}
-        ${hypothesesHtml ? `<div class="section"><div class="section-header">Hypotheses</div>${hypothesesHtml}</div>` : ''}
-        ${findingsHtml ? `<div class="section"><div class="section-header">Findings (${findingsCount})</div>${findingsHtml}</div>` : ''}
-        ${recsHtml ? `<div class="section"><div class="section-header">Recommendations</div>${recsHtml}</div>` : ''}
-        ${report.error ? `<div class="section"><div class="section-header">Warnings</div><div class="warning-card">${this.esc(report.error)}</div></div>` : ''}
+        ${shortSummary ? `<div class="summary">${this.esc(shortSummary)}</div>` : ''}
+
+        ${changes.length ? `<div class="divider">Changes &amp; Impact (${changes.length})</div>${changesHtml}` : ''}
+
+        ${allFiles.length ? `<div class="files-section"><div class="divider">Affected Files (${allFiles.length})</div>${filesHtml}</div>` : ''}
 
         <div class="actions">
             <button class="btn" id="rerunBtn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-                Re-run Investigation
+                Re-run
             </button>
             <button class="btn btn-primary" id="applyBtn">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
@@ -711,36 +668,33 @@ export class PanelManager {
         document.getElementById('rerunBtn').addEventListener('click', function() {
             vscode.postMessage({ command: 'rerun', taskId: taskId });
         });
-
         document.getElementById('applyBtn').addEventListener('click', function() {
             var btn = document.getElementById('applyBtn');
             var status = document.getElementById('patchStatus');
             btn.disabled = true;
-            btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" style="animation:spin 1s linear infinite"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg> Generating fixes...';
+            btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" style="animation:spin 1s linear infinite"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg> Generating...';
             status.className = 'patch-status show loading';
-            status.textContent = 'Asking Claude to generate code fixes...';
+            status.textContent = 'Generating code fixes...';
             vscode.postMessage({ command: 'applyFixes', investigationId: investigationId, taskId: taskId });
         });
-
         window.addEventListener('message', function(e) {
             var msg = e.data;
             var btn = document.getElementById('applyBtn');
             var status = document.getElementById('patchStatus');
             if (msg.command === 'patchStatus') {
                 if (msg.status === 'success') {
-                    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="16" height="16" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg> Fixes Applied';
+                    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg> Applied';
                     status.className = 'patch-status show success';
                     status.textContent = msg.message || 'Done.';
                 } else if (msg.status === 'error') {
                     btn.disabled = false;
-                    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" stroke-linecap="round"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg> Apply Fixes';
+                    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14" stroke-linecap="round"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg> Apply Fixes';
                     status.className = 'patch-status show error';
                     status.textContent = msg.message || 'Failed.';
                 }
             }
         });
     })();
-    </style>
     </script>
 </body>
 </html>`;
