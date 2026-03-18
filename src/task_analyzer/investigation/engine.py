@@ -1166,6 +1166,11 @@ class InvestigationEngine:
         if ws_arch:
             parts.append(f"\n# [WORKSPACE_ARCHITECTURE]\n{ws_arch}")
 
+        # ── [CODE] Workspace Index — entity-matched classes, routes, deps ──
+        idx_context = self._build_workspace_index_context(investigation_plan, classification)
+        if idx_context:
+            parts.append(f"\n# [CODE] Workspace Index Matches\n{idx_context}")
+
         # Task classification context
         if classification:
             parts.append(f"\n# Task Classification")
@@ -1428,6 +1433,95 @@ class InvestigationEngine:
                 )
             except Exception:
                 pass
+
+        return "\n".join(sections) if sections else ""
+
+    def _build_workspace_index_context(
+        self, investigation_plan: Any | None = None,
+        classification: TaskClassification | None = None,
+    ) -> str:
+        """
+        Query the workspace index for entity-relevant code artifacts.
+
+        Returns concrete [CODE] evidence: matching classes with their layers,
+        file paths, API routes, dependencies, and table references.
+        This gives Claude specific code locations instead of just architecture stats.
+        """
+        if not self._workspace_index:
+            return ""
+
+        sections = []
+        entities = []
+        if investigation_plan and investigation_plan.entities:
+            entities = investigation_plan.entities[:15]
+        elif classification and classification.priority_entities:
+            entities = classification.priority_entities[:15]
+
+        if not entities:
+            return ""
+
+        seen_classes = set()
+
+        # Find classes matching entities — grouped by layer
+        layer_groups: dict[str, list[dict]] = {}
+        for entity in entities:
+            if len(entity) < 3:
+                continue
+            classes = self._workspace_index.find_classes_by_entity(entity)
+            for c in classes[:8]:
+                key = f"{c['repo']}/{c['name']}"
+                if key in seen_classes:
+                    continue
+                seen_classes.add(key)
+                layer = c.get("layer", "unknown")
+                if layer not in layer_groups:
+                    layer_groups[layer] = []
+                layer_groups[layer].append(c)
+
+        # Format by layer (controllers first, then services, then repos, etc.)
+        layer_order = [
+            "api_controller", "service", "handler", "repository",
+            "data_access", "model", "validator", "unknown",
+        ]
+        for layer in layer_order:
+            group = layer_groups.get(layer, [])
+            if not group:
+                continue
+            label = layer.replace("_", " ").title()
+            sections.append(f"\n## {label}s ({len(group)})")
+            for c in group[:10]:
+                sections.append(
+                    f"- **{c['name']}** in {c['repo']} (`{c['file_path']}`)"
+                )
+                # Add dependencies for this class
+                deps = self._workspace_index.find_class_dependencies(c["name"])
+                if deps:
+                    sections.append(f"  Dependencies: {', '.join(deps[:5])}")
+                # Add table references for this class
+                tables = self._workspace_index.find_tables_referenced_by_class(c["name"])
+                if tables:
+                    sections.append(f"  DB Tables: {', '.join(tables[:5])}")
+
+        # Find relevant API routes
+        route_sections = []
+        for entity in entities[:8]:
+            if len(entity) < 3:
+                continue
+            routes = self._workspace_index.find_api_routes(entity)
+            for r in routes[:5]:
+                route_line = f"- {r['http_method']} `{r['route_path']}` -> {r['class_name']} (`{r['file_path']}`)"
+                if route_line not in route_sections:
+                    route_sections.append(route_line)
+
+        if route_sections:
+            sections.append(f"\n## API Routes ({len(route_sections)})")
+            sections.extend(route_sections[:15])
+
+        if sections:
+            sections.insert(0,
+                "The following code artifacts were found in the persistent workspace index "
+                "and are relevant to the entities extracted from the task:"
+            )
 
         return "\n".join(sections) if sections else ""
 
