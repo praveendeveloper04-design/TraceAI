@@ -952,16 +952,17 @@ class InvestigationEngine:
                 sql_results=sql_results,
             )
 
-            # Step 5: Create tools (only from healthy connectors)
-            tools = self._build_tools(task)
-            tool_names = [t.name for t in tools]
+            # Step 5: Skip tool building — PDI AI Gateway rejects tool calling
+            tools: list = []
             report.steps.append(InvestigationStep(
                 step_number=5,
-                action="Preparing investigation tools",
-                reasoning=f"Available tools: {', '.join(tool_names) if tool_names else 'None'}",
+                action="Preparing investigation",
+                reasoning="Direct analysis mode (tool calling disabled for gateway compatibility)",
             ))
 
-            # Step 6: Run the AI investigation (with graceful fallback)
+            # Step 6: Run the AI investigation
+            # PDI AI Gateway does not support tool calling — send without tools
+            # to avoid the retry penalty on every investigation
             await _emit("ai_reasoning", "Running AI reasoning with Claude...")
             report.steps.append(InvestigationStep(
                 step_number=6,

@@ -32,6 +32,9 @@ class SqlDatabaseConnector(BaseConnector):
     description = "Connect to SQL databases for read-only investigation queries"
     required_credentials = ["connection_string"]
 
+    # Class-level flag: once SQL fails, skip for the rest of this process
+    _sql_unreachable: bool = False
+
     def __init__(self, config: ConnectorConfig, credential_manager: CredentialManager) -> None:
         super().__init__(config, credential_manager)
         self._engine: Engine | None = None
@@ -39,26 +42,38 @@ class SqlDatabaseConnector(BaseConnector):
         self._security_guard = SecurityGuard(safe_mode=True)
 
     def _get_engine(self) -> Engine:
+        if SqlDatabaseConnector._sql_unreachable:
+            raise ConnectionError(f"SQL Server previously unreachable — skipping to avoid timeout")
         if self._engine is None:
             conn_str = self._get_credential("connection_string")
             if not conn_str:
                 raise ValueError("SQL connection string not found in keychain")
+            # Add connection timeout of 5 seconds for SQL Server (pyodbc)
+            if "timeout" not in conn_str.lower() and "sqlite" not in conn_str.lower():
+                separator = "&" if "?" in conn_str else "?"
+                conn_str = f"{conn_str}{separator}connect_timeout=5"
             self._engine = create_engine(
                 conn_str,
                 pool_pre_ping=True,
                 pool_size=2,
                 max_overflow=0,
-                connect_args={"timeout": QUERY_TIMEOUT_SECONDS} if "sqlite" in conn_str else {},
+                connect_args={"timeout": 5} if "sqlite" in conn_str else {},
             )
         return self._engine
 
     async def validate_connection(self) -> bool:
-        engine = self._get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logger.info("sql_connected", db=self._db_name)
-        self._connected = True
-        return True
+        try:
+            engine = self._get_engine()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info("sql_connected", db=self._db_name)
+            self._connected = True
+            SqlDatabaseConnector._sql_unreachable = False
+            return True
+        except Exception as exc:
+            SqlDatabaseConnector._sql_unreachable = True
+            logger.warning("sql_unreachable", db=self._db_name, error=str(exc)[:100])
+            raise
 
     async def fetch_tasks(self, **kwargs: Any) -> list[Task]:
         return []  # SQL is not a task source
