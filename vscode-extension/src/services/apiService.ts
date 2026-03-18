@@ -275,6 +275,8 @@ export class ApiService {
         const resp = await this.client.post('/api/generate-patch', {
             investigation_id: investigationId,
             workspace_path: workspacePath || null,
+        }, {
+            timeout: 300000, // 5 minutes — Claude generates code patches
         });
         return resp.data;
     }
