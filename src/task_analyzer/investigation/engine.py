@@ -1442,6 +1442,10 @@ class InvestigationEngine:
                 tables = self._workspace_index.find_tables_referenced_by_class(c["name"])
                 if tables:
                     sections.append(f"  DB Tables: {', '.join(tables[:5])}")
+                # Read key code snippet from the actual source file
+                snippet = self._read_class_snippet(c)
+                if snippet:
+                    sections.append(f"  ```\n{snippet}\n  ```")
 
         # Find relevant API routes
         route_sections = []
@@ -1465,6 +1469,40 @@ class InvestigationEngine:
             )
 
         return "\n".join(sections) if sections else ""
+
+    def _read_class_snippet(self, class_info: dict) -> str:
+        """Read a code snippet from the source file around the class declaration."""
+        try:
+            # Resolve full path from workspace index
+            conn = self._workspace_index._get_conn()
+            row = conn.execute(
+                "SELECT r.path FROM repositories r JOIN code_classes c ON c.repo_id = r.id "
+                "WHERE c.name = ? AND c.file_path = ? LIMIT 1",
+                (class_info["name"], class_info["file_path"]),
+            ).fetchone()
+            if not row:
+                return ""
+
+            full_path = Path(row["path"]) / class_info["file_path"]
+            if not full_path.exists():
+                return ""
+
+            content = full_path.read_text(encoding="utf-8", errors="ignore")
+            lines = content.split("\n")
+            line_num = class_info.get("line_number", 0) or 0
+
+            # Extract ~40 lines around the class declaration
+            start = max(0, line_num - 3)
+            end = min(len(lines), start + 40)
+            snippet = "\n".join(lines[start:end])
+
+            # Truncate if too long
+            if len(snippet) > 1500:
+                snippet = snippet[:1500] + "\n  // ... truncated"
+
+            return snippet
+        except Exception:
+            return ""
 
     def _build_evidence_quality_summary(
         self, evidence: dict | None, skill_results: dict | None,
