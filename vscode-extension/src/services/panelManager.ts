@@ -143,6 +143,7 @@ export class PanelManager {
 
             this.panels.set(key, { panel, taskId: report.task_id, investigationId });
         } catch (error) {
+            console.error('TraceAI: Failed to load investigation:', error);
             vscode.window.showErrorMessage(`Failed to load investigation: ${error}`);
         }
     }
@@ -469,10 +470,17 @@ export class PanelManager {
         const sentences = rawSummary.split(/(?<=[.!?])\s+/).filter(s => s.trim());
         const shortSummary = sentences.slice(0, 2).join(' ');
 
-        // Affected areas: group by file path prefix
+        // Affected areas: filter to actual source code files only
+        const sourceExtensions = ['.cs', '.py', '.ts', '.js', '.java', '.go', '.rs', '.rb', '.xml', '.yaml', '.yml'];
+        const noisePatterns = ['Diagnostic', 'diagnostic', '.json', '.ps1', '.sh', '.md', '.txt', '.log', '.csv'];
+        const isSourceFile = (f: string) => {
+            if (noisePatterns.some(p => f.includes(p))) { return false; }
+            if (f.includes(':')) { return false; } // line references like file.json:6
+            return sourceExtensions.some(ext => f.endsWith(ext)) || f.includes('/Controllers/') || f.includes('/Services/') || f.includes('/Models/');
+        };
         const affectedFiles = report.affected_files || [];
         const fileRefs = (report.findings || []).flatMap(f => f.file_references || []);
-        const allFiles = [...new Set([...affectedFiles, ...fileRefs])].filter(f => f);
+        const allFiles = [...new Set([...affectedFiles, ...fileRefs])].filter(f => f && isSourceFile(f));
 
         // Build change items from findings — only verified + hypothesis with confidence > 30%
         const changes = (report.findings || [])

@@ -242,7 +242,6 @@ class AzureDevOpsConnector(BaseConnector):
         # Build WIQL query — default to @Me (current authenticated user)
         conditions = [
             "[System.TeamProject] = @project",
-            "[System.WorkItemType] IN ('Task', 'Bug', 'User Story', 'Issue', 'Feature')",
         ]
         if assigned_to:
             conditions.append(f"[System.AssignedTo] = '{assigned_to}'")

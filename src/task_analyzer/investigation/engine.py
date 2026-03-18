@@ -147,7 +147,7 @@ If you cannot find the root cause from the provided evidence:
     "recommendations": [
         "Actionable recommendation 1"
     ],
-    "affected_files": ["path/to/file.py -- ONLY files that NEED TO BE MODIFIED to fix this issue, NOT files you found during investigation"],
+    "affected_files": ["ONLY list files that NEED CODE CHANGES to fix this issue. Do NOT list diagnostic scripts, JSON logs, config files, or files you merely read during investigation. List the actual source code files (controllers, services, repositories, models) where code modifications are required."],
     "affected_services": ["service-name"]
 }}
 ```
