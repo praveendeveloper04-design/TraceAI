@@ -112,7 +112,7 @@ export class PanelManager {
         const key = `inv:${investigationId}`;
         const existing = this.panels.get(key);
         if (existing) {
-            existing.panel.reveal(vscode.ViewColumn.Active);
+            existing.panel.reveal(vscode.ViewColumn.Beside);
             return;
         }
 
@@ -121,7 +121,7 @@ export class PanelManager {
             const panel = vscode.window.createWebviewPanel(
                 'traceaiInvestigation',
                 `Investigation: ${report.task_title?.substring(0, 40) || investigationId}`,
-                vscode.ViewColumn.Active,
+                vscode.ViewColumn.Beside,
                 {
                     enableScripts: true,
                     retainContextWhenHidden: false,
