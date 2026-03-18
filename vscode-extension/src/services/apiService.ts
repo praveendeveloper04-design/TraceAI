@@ -88,7 +88,7 @@ export class ApiService {
     constructor(port: number = 7420) {
         this.client = axios.create({
             baseURL: `http://127.0.0.1:${port}`,
-            timeout: 30000, // 30 seconds default for quick calls
+            timeout: 120000, // 2 minutes default — Azure CLI token acquisition can be slow
             headers: { 'Content-Type': 'application/json' },
         });
     }
