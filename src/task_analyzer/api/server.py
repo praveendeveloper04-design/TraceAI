@@ -259,11 +259,11 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
 
         async def _progress(stage: str, message: str) -> None:
             progress_map = {
-                "loading_ticket": 5, "classifying": 8,
-                "parallel_analysis": 10, "parallel_execution": 12,
-                "deep_investigation": 25, "skills_execution": 30,
-                "sql_intelligence": 45,
-                "evidence_aggregation": 50, "building_graph": 60,
+                "loading_ticket": 3, "indexing_workspace": 5,
+                "classifying": 10, "parallel_analysis": 15,
+                "parallel_execution": 20, "deep_investigation": 30,
+                "skills_execution": 35, "sql_intelligence": 45,
+                "evidence_aggregation": 55, "building_graph": 60,
                 "building_context": 70, "ai_reasoning": 85,
                 "generating_report": 95,
             }

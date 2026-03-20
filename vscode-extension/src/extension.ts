@@ -300,6 +300,7 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
                 // Stage keys MUST match panelManager.ts getProgressHtml() stageKeys
                 const stages = [
                     { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
+                    { key: 'indexing_workspace', label: 'Indexing workspace (one-time)...', ms: 500 },
                     { key: 'classifying', label: 'Classifying task...', ms: 400 },
                     { key: 'parallel_analysis', label: 'Multi-layer analysis...', ms: 1000 },
                     { key: 'deep_investigation', label: 'Deep evidence collection...', ms: 1500 },

@@ -501,6 +501,7 @@ class InvestigationEngine:
                     self._workspace_index = WorkspaceIndex()
 
                     # Auto-index repos that haven't been indexed or are stale (>24h)
+                    self._needs_indexing = []
                     for repo_info in workspace.repos:
                         repo_name = repo_info.get("name", "")
                         repo_path = repo_info.get("path", "")
@@ -508,33 +509,9 @@ class InvestigationEngine:
                             continue
                         age = self._workspace_index.get_repo_scan_age(repo_name)
                         if age is None or age > 86400:  # 24 hours
-                            logger.info("indexing_repository", repo=repo_name)
-                            self._workspace_index.index_repository(repo_name, repo_path)
+                            self._needs_indexing.append((repo_name, repo_path))
 
-                    # Build schema relations if SQL connector available
-                    db_conn = None
-                    for cn, co in registry.get_all_instances().items():
-                        ct = getattr(co, "connector_type", None)
-                        if ct and hasattr(ct, "value") and ct.value == "sql_database":
-                            db_conn = co
-                            break
-                    if db_conn:
-                        from task_analyzer.workspace_intelligence.schema_relation_builder import SchemaRelationBuilder
-                        builder = SchemaRelationBuilder()
-                        # Use first tenant DB from system map if available
-                        try:
-                            from task_analyzer.investigation.planner import load_system_map
-                            smap = load_system_map()
-                            tenant_names = smap.get_all_tenant_names()
-                            if tenant_names:
-                                tenant_db = smap.resolve_tenant_db(tenant_names[0])
-                                fk_age = self._workspace_index._get_conn().execute(
-                                    "SELECT COUNT(*) FROM db_foreign_keys"
-                                ).fetchone()[0]
-                                if fk_age == 0:
-                                    builder.build(self._workspace_index, db_conn, tenant_db)
-                        except Exception as fk_exc:
-                            logger.debug("schema_relation_build_skipped", error=str(fk_exc)[:100])
+                    # Schema relations are built during investigate() with progress feedback
 
                     idx_stats = self._workspace_index.get_stats()
                     logger.info("workspace_index_ready", **idx_stats)
@@ -597,7 +574,49 @@ class InvestigationEngine:
         await _emit("loading_ticket", "Loading ticket details...")
 
         try:
-            # Step 0: Classify the task
+            # Step 0a: Run deferred workspace indexing (one-time, ~5-8 min per repo)
+            if hasattr(self, '_needs_indexing') and self._needs_indexing:
+                total_repos = len(self._needs_indexing)
+                for i, (repo_name, repo_path) in enumerate(self._needs_indexing):
+                    await _emit(
+                        "indexing_workspace",
+                        f"One-time indexing: {repo_name} ({i+1}/{total_repos})... This may take a few minutes.",
+                    )
+                    logger.info("indexing_repository", repo=repo_name)
+                    self._workspace_index.index_repository(repo_name, repo_path)
+                    logger.info("repository_indexed_deferred", repo=repo_name)
+
+                # Build schema relations if needed
+                if self._workspace_index:
+                    try:
+                        fk_count = self._workspace_index._get_conn().execute(
+                            "SELECT COUNT(*) FROM db_foreign_keys"
+                        ).fetchone()[0]
+                        if fk_count == 0:
+                            await _emit("indexing_workspace", "Building database relationship graph...")
+                            db_conn = None
+                            for cn, co in self.registry.get_all_instances().items():
+                                ct = getattr(co, "connector_type", None)
+                                if ct and hasattr(ct, "value") and ct.value == "sql_database":
+                                    db_conn = co
+                                    break
+                            if db_conn:
+                                from task_analyzer.workspace_intelligence.schema_relation_builder import SchemaRelationBuilder
+                                from task_analyzer.investigation.planner import load_system_map
+                                smap = load_system_map()
+                                tenant_names = smap.get_all_tenant_names()
+                                if tenant_names:
+                                    tenant_db = smap.resolve_tenant_db(tenant_names[0])
+                                    SchemaRelationBuilder().build(self._workspace_index, db_conn, tenant_db)
+                    except Exception:
+                        pass
+
+                self._needs_indexing = []  # Done, don't re-index
+                idx_stats = self._workspace_index.get_stats()
+                await _emit("indexing_workspace", f"Indexing complete: {idx_stats['classes']} classes, {idx_stats['api_routes']} routes indexed.")
+                logger.info("workspace_index_ready", **idx_stats)
+
+            # Step 0b: Classify the task
             classification = None
             try:
                 classification = self.task_classifier.classify(
