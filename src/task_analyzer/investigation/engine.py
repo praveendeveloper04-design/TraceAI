@@ -410,6 +410,17 @@ class InvestigationEngine:
         # Initialize Claude via LangChain (with API key sanitization)
         self.llm = _create_llm(config)
 
+        # Wrap LLM with resilience layer (retry, circuit breaker, cache)
+        from task_analyzer.core.llm_resilience import ResilientLLM
+        self._resilient_llm = ResilientLLM(
+            self.llm,
+            max_retries=3,
+            base_delay=2.0,
+            timeout=90.0,
+            cache_ttl=3600.0,
+            enable_cache=True,
+        )
+
         # Security, rate limiting, and audit logging
         self.guard = SecurityGuard(safe_mode=(config.mode == "safe"))
         self.rate_limiter = RateLimiter()
@@ -913,59 +924,30 @@ class InvestigationEngine:
                 self._parse_result(result, report)
                 llm_succeeded = True
 
+                # Log resilience metrics
+                metrics = self._resilient_llm.get_metrics()
                 report.steps.append(InvestigationStep(
                     step_number=6,
                     action="AI analysis completed",
-                    reasoning="Extracted structured findings from AI output",
+                    reasoning=f"LLM calls: {metrics['total_calls']}, retries: {metrics['retried']}, cache hits: {metrics['cache_hits']}",
                 ))
             except Exception as llm_exc:
                 llm_error_msg = str(llm_exc)
                 llm_error_type = type(llm_exc).__name__
 
-                # If the error is tool-related, retry without tools
-                if tools and ("tool" in llm_error_msg.lower() or "toolUse" in llm_error_msg or "toolResult" in llm_error_msg):
-                    logger.warning(
-                        "llm_tool_error_retrying_without_tools",
-                        task_id=task.id,
-                        error=llm_error_msg[:200],
-                    )
-                    try:
-                        result = await self._run_investigation(context, [])
-                        self._parse_result(result, report)
-                        llm_succeeded = True
-
-                        report.steps.append(InvestigationStep(
-                            step_number=6,
-                            action="AI analysis completed (without tools)",
-                            reasoning="Tool calling failed; retried with direct analysis",
-                        ))
-                    except Exception as retry_exc:
-                        logger.error(
-                            "llm_call_failed",
-                            task_id=task.id,
-                            error=str(retry_exc),
-                            error_type=type(retry_exc).__name__,
-                            retry=True,
-                        )
-                        report.steps.append(InvestigationStep(
-                            step_number=6,
-                            action="AI analysis failed — producing partial report",
-                            reasoning=f"LLM error: {type(retry_exc).__name__}: {retry_exc}",
-                        ))
-                        self._build_partial_report(report, task, evidence, hypotheses, skill_errors)
-                else:
-                    logger.error(
-                        "llm_call_failed",
-                        task_id=task.id,
-                        error=llm_error_msg[:500],
-                        error_type=llm_error_type,
-                    )
-                    report.steps.append(InvestigationStep(
-                        step_number=6,
-                        action="AI analysis failed — producing partial report",
-                        reasoning=f"LLM error: {llm_error_type}: {llm_error_msg[:200]}",
-                    ))
-                    self._build_partial_report(report, task, evidence, hypotheses, skill_errors)
+                logger.error(
+                    "llm_call_failed",
+                    task_id=task.id,
+                    error=llm_error_msg[:500],
+                    error_type=llm_error_type,
+                    resilience_metrics=self._resilient_llm.get_metrics(),
+                )
+                report.steps.append(InvestigationStep(
+                    step_number=6,
+                    action="AI analysis failed — producing partial report",
+                    reasoning=f"LLM error: {llm_error_type}: {llm_error_msg[:200]}",
+                ))
+                self._build_partial_report(report, task, evidence, hypotheses, skill_errors)
 
             # Attach graph, hypotheses, and evidence to report
             await _emit("generating_report", "Generating investigation report...")
@@ -1645,7 +1627,7 @@ class InvestigationEngine:
     async def _run_investigation(
         self, context: str, tools: list[StructuredTool]
     ) -> dict[str, Any]:
-        """Execute the LangChain investigation chain."""
+        """Execute the LangChain investigation chain with resilience."""
         messages = [
             SystemMessage(content=INVESTIGATION_SYSTEM_PROMPT),
             HumanMessage(content=f"""Please investigate the following task and produce a structured investigation report.
@@ -1656,31 +1638,11 @@ Analyze this thoroughly. Use available tools if they would help gather more evid
 Produce your findings as the JSON structure described in your instructions."""),
         ]
 
-        if tools:
-            # Use tool-calling agent
-            llm_with_tools = self.llm.bind_tools(tools)
-            response = await llm_with_tools.ainvoke(messages)
+        # Use resilient LLM wrapper (retry + circuit breaker + cache)
+        content = await self._resilient_llm.invoke(messages)
 
-            # Handle tool calls if any
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name", "")
-                    tool_args = tool_call.get("args", {})
-                    matching_tool = next((t for t in tools if t.name == tool_name), None)
-                    if matching_tool:
-                        try:
-                            tool_result = await matching_tool.ainvoke(tool_args)
-                            messages.append(response)
-                            messages.append(HumanMessage(
-                                content=f"Tool '{tool_name}' returned:\n{tool_result}\n\nContinue your investigation with this new information."
-                            ))
-                        except Exception as exc:
-                            logger.warning("tool_call_failed", tool=tool_name, error=str(exc))
-
-                # Get final response after tool usage
-                response = await self.llm.ainvoke(messages)
-        else:
-            response = await self.llm.ainvoke(messages)
+        # Try to parse as JSON
+        return self._extract_json(content)
 
         # Extract content
         content = response.content if hasattr(response, "content") else str(response)
