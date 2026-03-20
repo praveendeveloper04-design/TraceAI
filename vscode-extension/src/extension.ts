@@ -254,6 +254,10 @@ async function mainFlow(): Promise<void> {
     }
 
     statusBarItem.text = '$(loading~spin) TraceAI: Loading tasks...';
+
+    // Check if workspace index needs building (runs before task loading)
+    await checkAndRunIndexing();
+
     const cached = await taskCache.loadCached();
     if (cached.length > 0) {
         taskTreeProvider.setTasks(cached);
@@ -281,6 +285,61 @@ async function refreshTasks(): Promise<void> {
     }
 }
 
+/**
+ * Check if the workspace intelligence index needs building.
+ * If stale, opens a dedicated indexing panel and runs indexing.
+ * If fresh, skips silently.
+ */
+async function checkAndRunIndexing(): Promise<void> {
+    try {
+        const indexStatus = await apiService.getIndexStatus();
+
+        if (indexStatus.status === 'fresh') {
+            // Index is up to date — skip
+            return;
+        }
+
+        if (indexStatus.status === 'unconfigured') {
+            // No workspace profile — skip silently
+            return;
+        }
+
+        if (indexStatus.status === 'stale') {
+            const staleRepos = indexStatus.stale_repos || [];
+            if (staleRepos.length === 0) { return; }
+
+            // Open dedicated indexing panel
+            statusBarItem.text = '$(loading~spin) TraceAI: Building index...';
+            const indexPanel = panelManager.showIndexingPanel(staleRepos);
+
+            try {
+                // Run indexing (this can take 3-9 minutes)
+                const result = await apiService.runIndex();
+
+                // Show completion in panel
+                panelManager.updateIndexingComplete(
+                    result.classes,
+                    result.repos_indexed,
+                    3000, // auto-close after 3 seconds
+                );
+
+                statusBarItem.text = `$(check) TraceAI: ${result.classes} classes indexed`;
+
+                // Brief pause so user sees the completion message
+                await new Promise(r => setTimeout(r, 1000));
+            } catch (error) {
+                // Indexing failed — close panel and continue (degraded mode)
+                try { indexPanel.dispose(); } catch {}
+                statusBarItem.text = '$(warning) TraceAI: Index build failed';
+                console.error('TraceAI: Indexing failed:', error);
+                // Don't block startup — investigation works without index
+            }
+        }
+    } catch {
+        // Index status check failed — skip silently, investigation works without index
+    }
+}
+
 async function investigateTask(taskId: string, taskTitle: string): Promise<void> {
     // Open a dedicated panel for this investigation
     const panel = panelManager.openProgress(taskId, taskTitle);
@@ -300,7 +359,6 @@ async function investigateTask(taskId: string, taskTitle: string): Promise<void>
                 // Stage keys MUST match panelManager.ts getProgressHtml() stageKeys
                 const stages = [
                     { key: 'loading_ticket', label: 'Loading ticket...', ms: 500 },
-                    { key: 'indexing_workspace', label: 'Indexing workspace (one-time)...', ms: 500 },
                     { key: 'classifying', label: 'Classifying task...', ms: 400 },
                     { key: 'parallel_analysis', label: 'Multi-layer analysis...', ms: 1000 },
                     { key: 'deep_investigation', label: 'Deep evidence collection...', ms: 1500 },

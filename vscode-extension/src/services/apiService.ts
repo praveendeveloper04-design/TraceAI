@@ -280,6 +280,18 @@ export class ApiService {
         });
         return resp.data;
     }
+
+    async getIndexStatus(): Promise<IndexStatus> {
+        const resp = await this.client.get('/api/index/status', { timeout: 10000 });
+        return resp.data;
+    }
+
+    async runIndex(): Promise<IndexResult> {
+        const resp = await this.client.post('/api/index', {}, {
+            timeout: 900000, // 15 minutes — indexing 23,000+ files can take 5-9 minutes
+        });
+        return resp.data;
+    }
 }
 
 export interface PatchFile {
@@ -295,4 +307,26 @@ export interface PatchResult {
     files: PatchFile[];
     raw_response?: string;
     parse_error?: string;
+}
+
+export interface IndexStatus {
+    status: 'fresh' | 'stale' | 'unconfigured';
+    classes?: number;
+    methods?: number;
+    api_routes?: number;
+    repos?: string[];
+    stale_repos?: string[];
+    all_repos?: string[];
+    reason?: string;
+    error?: string;
+}
+
+export interface IndexResult {
+    status: 'complete';
+    classes: number;
+    methods: number;
+    api_routes: number;
+    repos_indexed: string[];
+    duration_ms: number;
+    message?: string;
 }

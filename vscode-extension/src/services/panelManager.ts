@@ -148,6 +148,229 @@ export class PanelManager {
         }
     }
 
+    // ── Indexing Panel ────────────────────────────────────────────────
+
+    /**
+     * Open a dedicated indexing panel that shows progress while the
+     * workspace intelligence index is being built.
+     *
+     * Returns the panel so the caller can update it and close it.
+     */
+    showIndexingPanel(staleRepos: string[]): vscode.WebviewPanel {
+        const key = 'indexing';
+
+        // Reuse existing panel
+        const existing = this.panels.get(key);
+        if (existing) {
+            existing.panel.reveal(vscode.ViewColumn.Active);
+            return existing.panel;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            'traceaiIndexing',
+            'TraceAI: Building Index',
+            vscode.ViewColumn.Active,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: false,
+                localResourceRoots: [this.extensionUri],
+            },
+        );
+
+        panel.onDidDispose(() => { this.panels.delete(key); });
+        this.panels.set(key, { panel, taskId: 'indexing', investigationId: null });
+
+        const nonce = this.getNonce();
+        const repoListHtml = staleRepos.map(r =>
+            `<div class="repo-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="16" height="16"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg><span>${this.esc(r)}</span></div>`
+        ).join('');
+
+        panel.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script nonce="${nonce}">if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject()};}</script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
+    <style>
+        :root {
+            --bg: var(--vscode-editor-background, #0d1117);
+            --fg: var(--vscode-editor-foreground, #c9d1d9);
+            --surface: var(--vscode-editorWidget-background, #161b22);
+            --border: var(--vscode-panel-border, #30363d);
+            --accent: #58a6ff;
+            --accent-dim: rgba(88,166,255,0.12);
+            --success: #3fb950;
+            --success-dim: rgba(63,185,80,0.12);
+            --muted: var(--vscode-descriptionForeground, #8b949e);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+            color: var(--fg); background: var(--bg);
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh; padding: 32px;
+        }
+        .container { max-width: 520px; width: 100%; text-align: center; }
+
+        .logo {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 56px; height: 56px; border-radius: 16px;
+            background: var(--accent-dim); margin-bottom: 20px;
+        }
+        .logo svg { width: 28px; height: 28px; stroke: var(--accent); }
+
+        .brand {
+            font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
+            text-transform: uppercase; color: var(--accent); margin-bottom: 8px;
+        }
+        h1 {
+            font-size: 20px; font-weight: 600; color: var(--fg);
+            margin-bottom: 8px; line-height: 1.3;
+        }
+        .subtitle {
+            font-size: 13px; color: var(--muted); margin-bottom: 28px;
+            line-height: 1.5;
+        }
+
+        .repos {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px 20px; margin-bottom: 24px;
+            text-align: left;
+        }
+        .repos-label {
+            font-size: 10px; font-weight: 700; letter-spacing: 1px;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 10px;
+        }
+        .repo-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 6px 0; font-size: 13px; font-weight: 500;
+        }
+        .repo-item svg { stroke: var(--accent); flex-shrink: 0; }
+
+        .progress-ring {
+            display: inline-flex; align-items: center; justify-content: center;
+            margin-bottom: 20px;
+        }
+        .spinner {
+            width: 40px; height: 40px; border: 3px solid var(--border);
+            border-top-color: var(--accent); border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .timer-bar {
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            font-size: 13px; color: var(--muted); margin-bottom: 8px;
+        }
+        .timer {
+            font-variant-numeric: tabular-nums; font-weight: 600;
+            color: var(--fg); font-size: 14px;
+        }
+
+        .status-text {
+            font-size: 12px; color: var(--muted); min-height: 18px;
+        }
+
+        /* Completion state */
+        .complete-icon { display: none; margin-bottom: 20px; }
+        .complete-icon svg {
+            width: 48px; height: 48px; stroke: var(--success); stroke-width: 2;
+        }
+        body.done .spinner-wrap { display: none; }
+        body.done .complete-icon { display: inline-flex; }
+        body.done h1 { color: var(--success); }
+        body.done .repos { border-color: var(--success); background: var(--success-dim); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/>
+            </svg>
+        </div>
+        <div class="brand">TraceAI</div>
+        <h1 id="title">Building workspace intelligence index</h1>
+        <div class="subtitle">
+            This one-time process scans your repositories to enable instant investigations.
+            It typically takes 3-8 minutes.
+        </div>
+
+        <div class="repos">
+            <div class="repos-label">Repositories</div>
+            ${repoListHtml}
+        </div>
+
+        <div class="spinner-wrap">
+            <div class="progress-ring"><div class="spinner"></div></div>
+        </div>
+        <div class="complete-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+        </div>
+
+        <div class="timer-bar">
+            <span>Elapsed</span>
+            <span class="timer" id="elapsed">0s</span>
+        </div>
+        <div class="status-text" id="statusText">Scanning files...</div>
+    </div>
+    <script nonce="${nonce}">
+        (function() {
+            var vscode = acquireVsCodeApi();
+            var startTime = Date.now();
+
+            setInterval(function() {
+                var el = document.getElementById('elapsed');
+                if (el) {
+                    var secs = Math.floor((Date.now() - startTime) / 1000);
+                    var m = Math.floor(secs / 60);
+                    var s = secs % 60;
+                    el.textContent = m > 0 ? m + 'm ' + s + 's' : s + 's';
+                }
+            }, 1000);
+
+            window.addEventListener('message', function(e) {
+                var msg = e.data;
+                if (msg.command === 'indexingComplete') {
+                    document.body.classList.add('done');
+                    document.getElementById('title').textContent = 'Ready!';
+                    document.getElementById('statusText').textContent =
+                        msg.classes + ' classes indexed in ' + msg.repos_indexed.join(', ');
+                }
+            });
+        })();
+    </script>
+</body>
+</html>`;
+
+        return panel;
+    }
+
+    /**
+     * Update the indexing panel with completion data and auto-close after delay.
+     */
+    updateIndexingComplete(classes: number, reposIndexed: string[], autoCloseMs: number = 3000): void {
+        const key = 'indexing';
+        const entry = this.panels.get(key);
+        if (entry) {
+            entry.panel.webview.postMessage({
+                command: 'indexingComplete',
+                classes,
+                repos_indexed: reposIndexed,
+            });
+            // Auto-close after delay
+            if (autoCloseMs > 0) {
+                setTimeout(() => {
+                    try { entry.panel.dispose(); } catch {}
+                }, autoCloseMs);
+            }
+        }
+    }
+
     // ── Apply Fixes Handler ─────────────────────────────────────────────
 
     private async handleApplyFixes(panel: vscode.WebviewPanel, investigationId: string): Promise<void> {
@@ -209,18 +432,17 @@ export class PanelManager {
     private getProgressHtml(taskId: string, taskTitle: string): string {
         const nonce = this.getNonce();
         const stageKeys = [
-            'loading_ticket', 'indexing_workspace', 'classifying', 'parallel_analysis',
+            'loading_ticket', 'classifying', 'parallel_analysis',
             'deep_investigation', 'sql_intelligence', 'evidence_aggregation',
             'building_graph', 'building_context', 'ai_reasoning', 'generating_report',
         ];
         const stageNames = [
-            'Loading ticket', 'Indexing workspace', 'Classifying task', 'Multi-layer analysis',
+            'Loading ticket', 'Classifying task', 'Multi-layer analysis',
             'Deep evidence collection', 'SQL intelligence', 'Aggregating evidence',
             'Building graph', 'Building context', 'AI reasoning', 'Generating report',
         ];
         const stageIcons = [
             'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2',
-            'M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10',
             'M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z',
             'M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z',
             'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z',

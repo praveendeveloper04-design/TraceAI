@@ -259,7 +259,7 @@ async def investigate(request: InvestigateRequest) -> dict[str, Any]:
 
         async def _progress(stage: str, message: str) -> None:
             progress_map = {
-                "loading_ticket": 3, "indexing_workspace": 5,
+                "loading_ticket": 3,
                 "classifying": 10, "parallel_analysis": 15,
                 "parallel_execution": 20, "deep_investigation": 30,
                 "skills_execution": 35, "sql_intelligence": 45,
@@ -610,6 +610,173 @@ async def generate_patch(request: GeneratePatchRequest) -> dict[str, Any]:
     except Exception as exc:
         logger.error("patch_generation_failed", error=str(exc), error_type=type(exc).__name__)
         raise HTTPException(status_code=500, detail=f"Patch generation failed: {exc}")
+
+# ── Workspace Index Endpoints ────────────────────────────────────────────────
+
+@app.get("/api/index/status")
+async def get_index_status() -> dict[str, Any]:
+    """
+    Returns current workspace index state.
+
+    Responses:
+      - {"status": "fresh", "classes": N, "repos": [...]} — no indexing needed
+      - {"status": "stale", "stale_repos": [...]} — needs indexing
+      - {"status": "unconfigured"} — no workspace profile exists
+    """
+    from task_analyzer.storage.local_store import LocalStore
+
+    store = LocalStore()
+    config = store.load_config()
+    if not config:
+        return {"status": "unconfigured"}
+
+    # Load workspace profile
+    try:
+        from task_analyzer.knowledge.workspace_scanner import load_workspace_profile
+        workspace = load_workspace_profile()
+        if not workspace.repos:
+            return {"status": "unconfigured", "reason": "no_repos"}
+    except Exception as exc:
+        logger.debug("index_status_no_workspace", error=str(exc))
+        return {"status": "unconfigured", "reason": str(exc)}
+
+    # Check workspace index freshness
+    try:
+        from task_analyzer.workspace_intelligence.index import WorkspaceIndex
+        index = WorkspaceIndex()
+
+        stale_repos = []
+        all_repos = []
+        for repo_info in workspace.repos:
+            repo_name = repo_info.get("name", "")
+            repo_path = repo_info.get("path", "")
+            if not repo_name or not repo_path:
+                continue
+            all_repos.append({"name": repo_name, "path": repo_path})
+            age = index.get_repo_scan_age(repo_name)
+            if age is None or age > 86400:  # 24 hours
+                stale_repos.append({"name": repo_name, "path": repo_path})
+
+        if stale_repos:
+            return {
+                "status": "stale",
+                "stale_repos": [r["name"] for r in stale_repos],
+                "all_repos": [r["name"] for r in all_repos],
+            }
+
+        stats = index.get_stats()
+        return {
+            "status": "fresh",
+            "classes": stats.get("classes", 0),
+            "methods": stats.get("methods", 0),
+            "api_routes": stats.get("api_routes", 0),
+            "repos": [r["name"] for r in all_repos],
+        }
+    except Exception as exc:
+        logger.debug("index_status_check_failed", error=str(exc))
+        return {"status": "stale", "stale_repos": [r.get("name", "") for r in workspace.repos], "error": str(exc)}
+
+
+@app.post("/api/index")
+async def run_index() -> dict[str, Any]:
+    """
+    Run workspace indexing synchronously for all stale repos.
+
+    Indexes all repositories that haven't been indexed or are stale (>24h).
+    Builds schema relations if needed.
+
+    Returns:
+      {"status": "complete", "classes": N, "duration_ms": M, "repos_indexed": [...]}
+    """
+    import time as _time
+    from task_analyzer.storage.local_store import LocalStore
+
+    store = LocalStore()
+    config = store.load_config()
+    if not config:
+        raise HTTPException(status_code=400, detail="Not configured")
+
+    # Load workspace profile
+    try:
+        from task_analyzer.knowledge.workspace_scanner import load_workspace_profile
+        workspace = load_workspace_profile()
+        if not workspace.repos:
+            return {"status": "complete", "classes": 0, "duration_ms": 0, "repos_indexed": [], "message": "No repos configured"}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"No workspace profile: {exc}")
+
+    start = _time.time()
+    repos_indexed = []
+
+    try:
+        from task_analyzer.workspace_intelligence.index import WorkspaceIndex
+        index = WorkspaceIndex()
+
+        # Index stale repos
+        for repo_info in workspace.repos:
+            repo_name = repo_info.get("name", "")
+            repo_path = repo_info.get("path", "")
+            if not repo_name or not repo_path:
+                continue
+            age = index.get_repo_scan_age(repo_name)
+            if age is None or age > 86400:  # 24 hours
+                logger.info("indexing_repository_api", repo=repo_name)
+                index.index_repository(repo_name, repo_path)
+                repos_indexed.append(repo_name)
+                logger.info("repository_indexed_api", repo=repo_name)
+
+        # Build schema relations if needed
+        try:
+            fk_count = index._get_conn().execute(
+                "SELECT COUNT(*) FROM db_foreign_keys"
+            ).fetchone()[0]
+            if fk_count == 0 and config.connectors:
+                # Find SQL connector for schema discovery
+                from task_analyzer.connectors import create_default_registry
+                registry = create_default_registry()
+                db_conn = None
+                for conn_config in config.connectors:
+                    if conn_config.enabled and conn_config.connector_type.value == "sql_database":
+                        try:
+                            db_conn = registry.create(conn_config)
+                            break
+                        except Exception:
+                            pass
+                if db_conn:
+                    from task_analyzer.workspace_intelligence.schema_relation_builder import SchemaRelationBuilder
+                    from task_analyzer.investigation.planner import load_system_map
+                    smap = load_system_map()
+                    tenant_names = smap.get_all_tenant_names()
+                    if tenant_names:
+                        tenant_db = smap.resolve_tenant_db(tenant_names[0])
+                        SchemaRelationBuilder().build(index, db_conn, tenant_db)
+                        logger.info("schema_relations_built_api")
+        except Exception as schema_exc:
+            logger.debug("schema_relations_skipped_api", error=str(schema_exc)[:100])
+
+        stats = index.get_stats()
+        duration_ms = int((_time.time() - start) * 1000)
+
+        logger.info(
+            "index_complete_api",
+            repos_indexed=repos_indexed,
+            classes=stats.get("classes", 0),
+            duration_ms=duration_ms,
+        )
+
+        return {
+            "status": "complete",
+            "classes": stats.get("classes", 0),
+            "methods": stats.get("methods", 0),
+            "api_routes": stats.get("api_routes", 0),
+            "repos_indexed": repos_indexed,
+            "duration_ms": duration_ms,
+        }
+    except Exception as exc:
+        duration_ms = int((_time.time() - start) * 1000)
+        logger.error("index_failed_api", error=str(exc), duration_ms=duration_ms)
+        raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}")
+
 
 @app.get("/api/profiles")
 async def list_profiles() -> list[dict[str, Any]]:
