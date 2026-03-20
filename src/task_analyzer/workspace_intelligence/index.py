@@ -66,6 +66,9 @@ def _is_word_boundary_match(entity: str, text: str) -> bool:
         >>> _is_word_boundary_match("Scheduling", "SchedulingEngine.cs")
         True
     """
+    if not entity or not text:
+        return False
+
     if len(entity) > 4:
         return entity.lower() in text.lower()
 
@@ -90,15 +93,16 @@ def _is_word_boundary_match(entity: str, text: str) -> bool:
         return True
 
     # Check PascalCase boundaries in the ORIGINAL text (case-sensitive).
-    # Entity must start with uppercase and be preceded by a lowercase letter
-    # or be at the start of the string.
-    pascal_pattern = re.compile(
-        r"(?:^|(?<=[a-z]))"
-        + re.escape(entity[0].upper()) + re.escape(entity[1:])
-        + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
-    )
-    if pascal_pattern.search(text):
-        return True
+    # Try both capitalized form (Trip) and uppercase form (ITM) since
+    # the entity may arrive in any case.
+    for variant in [entity[0].upper() + entity[1:], entity.upper()]:
+        pascal_pattern = re.compile(
+            r"(?:^|(?<=[a-z])|(?<=[^a-zA-Z0-9]))"
+            + re.escape(variant)
+            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+        )
+        if pascal_pattern.search(text):
+            return True
 
     return False
 

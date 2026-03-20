@@ -61,6 +61,9 @@ def _is_entity_match(entity: str, text: str) -> bool:
     Returns:
         True if entity matches at a word boundary in text.
     """
+    if not entity or not text:
+        return False
+
     if len(entity) > 4:
         return entity.lower() in text.lower()
 
@@ -79,15 +82,17 @@ def _is_entity_match(entity: str, text: str) -> bool:
     if sep_pattern.search(text_lower):
         return True
 
-    # Check PascalCase boundaries in original text (case-sensitive)
-    cap_entity = entity[0].upper() + entity[1:] if entity else entity
-    pascal_pattern = re.compile(
-        r"(?:^|(?<=[a-z]))"
-        + re.escape(cap_entity)
-        + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
-    )
-    if pascal_pattern.search(text):
-        return True
+    # Check PascalCase boundaries in original text (case-sensitive).
+    # Try both capitalized form (Trip) and uppercase form (ITM) since
+    # the entity may have been lowercased by the caller.
+    for variant in [entity[0].upper() + entity[1:], entity.upper()]:
+        pascal_pattern = re.compile(
+            r"(?:^|(?<=[a-z])|(?<=[^a-zA-Z0-9]))"
+            + re.escape(variant)
+            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+        )
+        if pascal_pattern.search(text):
+            return True
 
     return False
 

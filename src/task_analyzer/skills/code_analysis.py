@@ -233,6 +233,9 @@ class CodeAnalysisSkill(BaseSkill):
             filename: Original filename preserving case (for PascalCase detection).
             filename_lower: Lowercased filename (for substring checks).
         """
+        if not entity or not filename_lower:
+            return False
+
         if len(entity) > 4:
             return entity in filename_lower
 
@@ -248,15 +251,16 @@ class CodeAnalysisSkill(BaseSkill):
         if sep_pattern.search(filename_lower):
             return True
 
-        # Check PascalCase boundaries in original filename (case-sensitive)
-        cap_entity = entity[0].upper() + entity[1:] if entity else entity
-        pascal_pattern = re.compile(
-            r"(?:^|(?<=[a-z]))"
-            + re.escape(cap_entity)
-            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
-        )
-        if pascal_pattern.search(filename):
-            return True
+        # Check PascalCase boundaries in original filename (case-sensitive).
+        # Try both capitalized (Trip) and uppercase (ITM) forms.
+        for variant in [entity[0].upper() + entity[1:], entity.upper()]:
+            pascal_pattern = re.compile(
+                r"(?:^|(?<=[a-z])|(?<=[^a-zA-Z0-9]))"
+                + re.escape(variant)
+                + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+            )
+            if pascal_pattern.search(filename):
+                return True
 
         return False
 
