@@ -411,15 +411,11 @@ class InvestigationEngine:
         self.llm = _create_llm(config)
 
         # Wrap LLM with resilience layer (retry, circuit breaker, cache)
-        from task_analyzer.core.llm_resilience import ResilientLLM
-        self._resilient_llm = ResilientLLM(
-            self.llm,
-            max_retries=3,
-            base_delay=2.0,
-            timeout=90.0,
-            cache_ttl=3600.0,
-            enable_cache=True,
+        from task_analyzer.core.llm_resilience import ResilientLLM, ResilienceConfig
+        resilience_cfg = ResilienceConfig(
+            model_name=config.llm_model,
         )
+        self._resilient_llm = ResilientLLM(self.llm, config=resilience_cfg)
 
         # Security, rate limiting, and audit logging
         self.guard = SecurityGuard(safe_mode=(config.mode == "safe"))
@@ -920,7 +916,7 @@ class InvestigationEngine:
 
             llm_succeeded = False
             try:
-                result = await self._run_investigation(context, tools)
+                result = await self._run_investigation(context, tools, task_id=task.id)
                 self._parse_result(result, report)
                 llm_succeeded = True
 
@@ -1625,7 +1621,7 @@ class InvestigationEngine:
         return tools
 
     async def _run_investigation(
-        self, context: str, tools: list[StructuredTool]
+        self, context: str, tools: list[StructuredTool], task_id: str = ""
     ) -> dict[str, Any]:
         """Execute the LangChain investigation chain with resilience."""
         messages = [
@@ -1639,13 +1635,7 @@ Produce your findings as the JSON structure described in your instructions."""),
         ]
 
         # Use resilient LLM wrapper (retry + circuit breaker + cache)
-        content = await self._resilient_llm.invoke(messages)
-
-        # Try to parse as JSON
-        return self._extract_json(content)
-
-        # Extract content
-        content = response.content if hasattr(response, "content") else str(response)
+        content = await self._resilient_llm.invoke(messages, task_id=task_id)
 
         # Try to parse as JSON
         return self._extract_json(content)
