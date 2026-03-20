@@ -32,6 +32,76 @@ logger = structlog.get_logger(__name__)
 
 INDEX_DB_PATH = Path.home() / ".traceai" / "workspace_index.db"
 
+
+# ─── Word-Boundary Matching Utility ──────────────────────────────────────────
+
+def _is_word_boundary_match(entity: str, text: str) -> bool:
+    """Check if entity appears at a word boundary in text.
+
+    For short entities (<=4 chars), requires the entity to appear at a
+    PascalCase boundary, underscore/hyphen boundary, or as a standalone word.
+    This prevents false positives like "ITM" matching "RhythmService".
+
+    For longer entities (>4 chars), plain substring match is acceptable
+    since false positives are much less likely with longer strings.
+
+    Args:
+        entity: The search term (e.g., "ITM", "Trip").
+        text: The text to search in (e.g., "ITMApiService.cs", "RhythmService.cs").
+
+    Returns:
+        True if entity appears at a word boundary in text.
+
+    Examples:
+        >>> _is_word_boundary_match("ITM", "ITMApiService.cs")
+        True
+        >>> _is_word_boundary_match("ITM", "RhythmService.cs")
+        False
+        >>> _is_word_boundary_match("ITM", "svc-itm-handler.cs")
+        True
+        >>> _is_word_boundary_match("Trip", "TripController.cs")
+        True
+        >>> _is_word_boundary_match("Trip", "StripService.cs")
+        False
+        >>> _is_word_boundary_match("Scheduling", "SchedulingEngine.cs")
+        True
+    """
+    if len(entity) > 4:
+        return entity.lower() in text.lower()
+
+    # For short entities, require word-boundary matching.
+    # Strategy: check if entity appears at a non-alphanumeric boundary
+    # (hyphen, underscore, dot, start/end) OR at a true PascalCase boundary
+    # (preceded by a lowercase letter and entity starts with uppercase).
+    entity_lower = entity.lower()
+    text_lower = text.lower()
+
+    # Quick check: entity must at least be a substring
+    if entity_lower not in text_lower:
+        return False
+
+    # Check non-alphanumeric boundaries (works case-insensitively)
+    sep_pattern = re.compile(
+        r"(?:^|(?<=[^a-zA-Z0-9]))"
+        + re.escape(entity_lower)
+        + r"(?:$|(?=[^a-zA-Z0-9]))",
+    )
+    if sep_pattern.search(text_lower):
+        return True
+
+    # Check PascalCase boundaries in the ORIGINAL text (case-sensitive).
+    # Entity must start with uppercase and be preceded by a lowercase letter
+    # or be at the start of the string.
+    pascal_pattern = re.compile(
+        r"(?:^|(?<=[a-z]))"
+        + re.escape(entity[0].upper()) + re.escape(entity[1:])
+        + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+    )
+    if pascal_pattern.search(text):
+        return True
+
+    return False
+
 # Skip directories during scanning
 SKIP_DIRS = frozenset({
     "node_modules", "bin", "obj", "dist", "build", "__pycache__",
@@ -430,17 +500,95 @@ class WorkspaceIndex:
             return time.time() - row["scanned_at"]
         return None
 
-    def find_classes_by_entity(self, entity: str) -> list[dict]:
-        """Find code classes matching an entity name."""
+    def find_classes_by_entity(
+        self, entity: str, repo_names: list[str] | None = None,
+    ) -> list[dict]:
+        """Find code classes matching an entity name, with relevance scoring.
+
+        Args:
+            entity: The entity name to search for.
+            repo_names: Optional list of repository names to restrict search to.
+                        When provided, only classes from these repos are returned.
+                        When None, searches all repos (backward compatible).
+
+        Returns:
+            List of matching classes sorted by relevance score (desc), then layer.
+        """
         conn = self._get_conn()
         pattern = f"%{entity}%"
-        rows = conn.execute(
-            "SELECT c.name, c.layer, c.file_path, c.line_number, r.name as repo "
-            "FROM code_classes c JOIN repositories r ON c.repo_id = r.id "
-            "WHERE c.name LIKE ? ORDER BY c.layer, c.name LIMIT 50",
-            (pattern,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+
+        if repo_names:
+            placeholders = ",".join("?" * len(repo_names))
+            rows = conn.execute(
+                "SELECT c.name, c.layer, c.file_path, c.line_number, r.name as repo "
+                "FROM code_classes c JOIN repositories r ON c.repo_id = r.id "
+                f"WHERE c.name LIKE ? AND r.name IN ({placeholders}) "
+                "ORDER BY c.layer, c.name LIMIT 50",
+                (pattern, *repo_names),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT c.name, c.layer, c.file_path, c.line_number, r.name as repo "
+                "FROM code_classes c JOIN repositories r ON c.repo_id = r.id "
+                "WHERE c.name LIKE ? ORDER BY c.layer, c.name LIMIT 50",
+                (pattern,),
+            ).fetchall()
+
+        results = [dict(r) for r in rows]
+        return self._score_entity_matches(entity, results)
+
+    def _score_entity_matches(self, entity: str, results: list[dict]) -> list[dict]:
+        """Score and sort entity match results by relevance.
+
+        Scoring tiers:
+            1.0 — Exact match (class name equals entity, case-insensitive)
+            0.8 — Word-boundary match (entity at PascalCase/underscore boundary)
+            0.7 — Prefix match (class name starts with entity)
+            0.3 — Substring match (entity embedded in class name)
+
+        Layer priority is used as a tiebreaker within the same score.
+        """
+        entity_lower = entity.lower()
+
+        # Regex for PascalCase word-boundary detection.
+        # Matches entity when preceded by start-of-string, a lowercase char,
+        # or a non-alpha char, and followed by end-of-string, an uppercase char,
+        # or a non-alpha char.
+        boundary_re = re.compile(
+            r"(?:^|(?<=[a-z])|(?<=[^a-zA-Z0-9]))"
+            + re.escape(entity)
+            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+            re.IGNORECASE,
+        )
+
+        layer_priority = {
+            "api_controller": 0, "service": 1, "handler": 2,
+            "repository": 3, "data_access": 4, "model": 5,
+            "validator": 6, "unknown": 7,
+        }
+
+        for r in results:
+            name_lower = r["name"].lower()
+
+            if name_lower == entity_lower:
+                score = 1.0
+            elif name_lower.startswith(entity_lower) and boundary_re.search(r["name"]):
+                score = 0.8
+            elif boundary_re.search(r["name"]):
+                score = 0.8
+            elif name_lower.startswith(entity_lower):
+                score = 0.7
+            else:
+                score = 0.3
+
+            r["_sort_key"] = (-score, layer_priority.get(r.get("layer", "unknown"), 7))
+
+        results.sort(key=lambda r: (r["_sort_key"], r["name"]))
+
+        for r in results:
+            r.pop("_sort_key", None)
+
+        return results
 
     def find_classes_by_layer(self, layer: str) -> list[dict]:
         """Find all classes of a specific layer type."""
@@ -464,34 +612,88 @@ class WorkspaceIndex:
         ).fetchall()
         return [r["table_name"] for r in rows]
 
-    def find_classes_referencing_table(self, table_name: str) -> list[dict]:
-        """Find code classes that reference a database table."""
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT c.name, c.layer, c.file_path, tr.ref_type, r.name as repo "
-            "FROM class_table_refs tr "
-            "JOIN code_classes c ON tr.class_id = c.id "
-            "JOIN repositories r ON c.repo_id = r.id "
-            "WHERE tr.table_name LIKE ? ORDER BY c.layer",
-            (f"%{table_name}%",),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def find_classes_referencing_table(
+        self, table_name: str, repo_names: list[str] | None = None,
+    ) -> list[dict]:
+        """Find code classes that reference a database table.
 
-    def find_api_routes(self, pattern: str = "") -> list[dict]:
-        """Find API routes, optionally filtered by pattern."""
+        Args:
+            table_name: Table name to search for.
+            repo_names: Optional repo filter. When provided, only returns
+                        classes from these repos.
+        """
         conn = self._get_conn()
-        if pattern:
+        pattern = f"%{table_name}%"
+
+        if repo_names:
+            placeholders = ",".join("?" * len(repo_names))
             rows = conn.execute(
-                "SELECT ar.http_method, ar.route_path, c.name as class_name, c.file_path "
-                "FROM api_routes ar JOIN code_classes c ON ar.class_id = c.id "
-                "WHERE ar.route_path LIKE ? OR c.name LIKE ? LIMIT 50",
-                (f"%{pattern}%", f"%{pattern}%"),
+                "SELECT c.name, c.layer, c.file_path, tr.ref_type, r.name as repo "
+                "FROM class_table_refs tr "
+                "JOIN code_classes c ON tr.class_id = c.id "
+                "JOIN repositories r ON c.repo_id = r.id "
+                f"WHERE tr.table_name LIKE ? AND r.name IN ({placeholders}) "
+                "ORDER BY c.layer",
+                (pattern, *repo_names),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT ar.http_method, ar.route_path, c.name as class_name, c.file_path "
-                "FROM api_routes ar JOIN code_classes c ON ar.class_id = c.id LIMIT 100",
+                "SELECT c.name, c.layer, c.file_path, tr.ref_type, r.name as repo "
+                "FROM class_table_refs tr "
+                "JOIN code_classes c ON tr.class_id = c.id "
+                "JOIN repositories r ON c.repo_id = r.id "
+                "WHERE tr.table_name LIKE ? ORDER BY c.layer",
+                (pattern,),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_api_routes(
+        self, pattern: str = "", repo_names: list[str] | None = None,
+    ) -> list[dict]:
+        """Find API routes, optionally filtered by pattern and/or repos.
+
+        Args:
+            pattern: Search pattern for route path or class name.
+            repo_names: Optional repo filter.
+        """
+        conn = self._get_conn()
+        if pattern:
+            if repo_names:
+                placeholders = ",".join("?" * len(repo_names))
+                rows = conn.execute(
+                    "SELECT ar.http_method, ar.route_path, c.name as class_name, "
+                    "c.file_path, r.name as repo "
+                    "FROM api_routes ar "
+                    "JOIN code_classes c ON ar.class_id = c.id "
+                    "JOIN repositories r ON c.repo_id = r.id "
+                    f"WHERE (ar.route_path LIKE ? OR c.name LIKE ?) "
+                    f"AND r.name IN ({placeholders}) LIMIT 50",
+                    (f"%{pattern}%", f"%{pattern}%", *repo_names),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ar.http_method, ar.route_path, c.name as class_name, c.file_path "
+                    "FROM api_routes ar JOIN code_classes c ON ar.class_id = c.id "
+                    "WHERE ar.route_path LIKE ? OR c.name LIKE ? LIMIT 50",
+                    (f"%{pattern}%", f"%{pattern}%"),
+                ).fetchall()
+        else:
+            if repo_names:
+                placeholders = ",".join("?" * len(repo_names))
+                rows = conn.execute(
+                    "SELECT ar.http_method, ar.route_path, c.name as class_name, "
+                    "c.file_path, r.name as repo "
+                    "FROM api_routes ar "
+                    "JOIN code_classes c ON ar.class_id = c.id "
+                    "JOIN repositories r ON c.repo_id = r.id "
+                    f"WHERE r.name IN ({placeholders}) LIMIT 100",
+                    (*repo_names,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ar.http_method, ar.route_path, c.name as class_name, c.file_path "
+                    "FROM api_routes ar JOIN code_classes c ON ar.class_id = c.id LIMIT 100",
+                ).fetchall()
         return [dict(r) for r in rows]
 
     def find_class_dependencies(self, class_name: str) -> list[str]:
@@ -555,8 +757,11 @@ class WorkspaceIndex:
             "class_table_refs": conn.execute("SELECT COUNT(*) FROM class_table_refs").fetchone()[0],
         }
 
-    def summarize_for_llm(self, entities: list[str] | None = None) -> str:
-        """Build a summary for LLM context, optionally filtered by entities."""
+    def summarize_for_llm(
+        self, entities: list[str] | None = None,
+        repo_names: list[str] | None = None,
+    ) -> str:
+        """Build a summary for LLM context, optionally filtered by entities and repos."""
         parts = ["## Workspace Intelligence Index"]
         stats = self.get_stats()
         parts.append(
@@ -567,13 +772,15 @@ class WorkspaceIndex:
 
         if entities:
             for entity in entities[:5]:
-                classes = self.find_classes_by_entity(entity)
+                classes = self.find_classes_by_entity(entity, repo_names=repo_names)
                 if classes:
                     parts.append(f"\n### Classes matching '{entity}'")
                     for c in classes[:5]:
                         parts.append(f"- {c['layer']}: **{c['name']}** ({c['repo']}/{c['file_path']})")
 
-                tables_from_code = self.find_classes_referencing_table(entity)
+                tables_from_code = self.find_classes_referencing_table(
+                    entity, repo_names=repo_names,
+                )
                 if tables_from_code:
                     parts.append(f"\n### Code referencing table '{entity}'")
                     for t in tables_from_code[:5]:

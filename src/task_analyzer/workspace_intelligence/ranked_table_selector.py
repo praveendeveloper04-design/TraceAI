@@ -57,6 +57,7 @@ class RankedTableSelector:
         entities: list[str],
         all_schema_tables: list[str],
         code_tables: list[str] | None = None,
+        repo_names: list[str] | None = None,
     ) -> list[RankedTable]:
         """
         Select and rank tables for investigation.
@@ -65,6 +66,7 @@ class RankedTableSelector:
             entities: Extracted entities from task text
             all_schema_tables: All tables from INFORMATION_SCHEMA
             code_tables: Tables discovered from code analysis (if available)
+            repo_names: Optional repo filter to scope index queries
 
         Returns:
             Ranked list of tables, highest priority first.
@@ -89,7 +91,9 @@ class RankedTableSelector:
                     continue
 
                 # Find classes matching this entity
-                classes = self.index.find_classes_by_entity(entity)
+                classes = self.index.find_classes_by_entity(
+                    entity, repo_names=repo_names,
+                )
                 for cls in classes[:5]:
                     # Find tables referenced by this class
                     tables = self.index.find_tables_referenced_by_class(cls["name"])

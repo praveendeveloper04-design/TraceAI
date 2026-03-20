@@ -209,7 +209,7 @@ class CodeAnalysisSkill(BaseSkill):
                     fname_lower = fname.lower()
                     # Check if filename matches any entity
                     for entity in entity_patterns:
-                        if entity in fname_lower:
+                        if self._is_entity_filename_match(entity, fname, fname_lower):
                             matched.append(Path(root) / fname)
                             break
 
@@ -217,6 +217,48 @@ class CodeAnalysisSkill(BaseSkill):
                     break
 
         return matched
+
+    @staticmethod
+    def _is_entity_filename_match(entity: str, filename: str, filename_lower: str) -> bool:
+        """Match entity against filename with word-boundary awareness for short entities.
+
+        For entities <=4 chars, requires the entity to appear at a word boundary
+        (start of name, after hyphen/underscore/dot, or at a PascalCase boundary).
+        This prevents short acronyms from matching embedded substrings in unrelated files.
+
+        For longer entities (>4 chars), plain substring match is used.
+
+        Args:
+            entity: The search term (lowercase).
+            filename: Original filename preserving case (for PascalCase detection).
+            filename_lower: Lowercased filename (for substring checks).
+        """
+        if len(entity) > 4:
+            return entity in filename_lower
+
+        if entity not in filename_lower:
+            return False
+
+        # Check non-alphanumeric boundaries (hyphen, underscore, dot, start/end)
+        sep_pattern = re.compile(
+            r"(?:^|(?<=[^a-zA-Z0-9]))"
+            + re.escape(entity)
+            + r"(?:$|(?=[^a-zA-Z0-9]))",
+        )
+        if sep_pattern.search(filename_lower):
+            return True
+
+        # Check PascalCase boundaries in original filename (case-sensitive)
+        cap_entity = entity[0].upper() + entity[1:] if entity else entity
+        pascal_pattern = re.compile(
+            r"(?:^|(?<=[a-z]))"
+            + re.escape(cap_entity)
+            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+        )
+        if pascal_pattern.search(filename):
+            return True
+
+        return False
 
     # ── Table Extraction ──────────────────────────────────────────────────
 

@@ -44,6 +44,54 @@ from task_analyzer.core.security_guard import SecurityGuard
 logger = structlog.get_logger(__name__)
 
 
+def _is_entity_match(entity: str, text: str) -> bool:
+    """Check if entity matches text with word-boundary awareness for short entities.
+
+    For entities <=4 chars, requires the entity to appear at a word boundary
+    (non-alphanumeric separator or PascalCase transition).
+    This prevents false positives like "trip" matching "StripService".
+
+    For longer entities (>4 chars), plain substring match is used since
+    false positives are much less likely with longer strings.
+
+    Args:
+        entity: The search term (lowercase).
+        text: The text to search in.
+
+    Returns:
+        True if entity matches at a word boundary in text.
+    """
+    if len(entity) > 4:
+        return entity.lower() in text.lower()
+
+    entity_lower = entity.lower()
+    text_lower = text.lower()
+
+    if entity_lower not in text_lower:
+        return False
+
+    # Check non-alphanumeric boundaries (hyphen, underscore, dot, start/end)
+    sep_pattern = re.compile(
+        r"(?:^|(?<=[^a-zA-Z0-9]))"
+        + re.escape(entity_lower)
+        + r"(?:$|(?=[^a-zA-Z0-9]))",
+    )
+    if sep_pattern.search(text_lower):
+        return True
+
+    # Check PascalCase boundaries in original text (case-sensitive)
+    cap_entity = entity[0].upper() + entity[1:] if entity else entity
+    pascal_pattern = re.compile(
+        r"(?:^|(?<=[a-z]))"
+        + re.escape(cap_entity)
+        + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
+    )
+    if pascal_pattern.search(text):
+        return True
+
+    return False
+
+
 class DeepInvestigator:
     """
     Iterative evidence collector that digs deep into repos and databases.
@@ -229,7 +277,7 @@ class DeepInvestigator:
                         continue
                     fname_lower = fname.lower()
                     for entity in entity_patterns:
-                        if entity in fname_lower:
+                        if _is_entity_match(entity, fname_lower):
                             full_path = Path(root) / fname
                             rel_path = str(full_path.relative_to(repo_path))
                             if not any(f["path"] == rel_path for f in self.evidence["code_files"]):
@@ -559,9 +607,9 @@ class DeepInvestigator:
                         full_path = Path(root) / fname
                         content = full_path.read_text(encoding="utf-8", errors="ignore")
                         for entity in entities[:3]:
-                            if len(entity) < 4:
+                            if len(entity) < 3:
                                 continue
-                            if entity.lower() in content.lower():
+                            if _is_entity_match(entity.lower(), content.lower()):
                                 rel = str(full_path.relative_to(repo_path))
                                 if not any(f["path"] == rel for f in self.evidence["code_files"]):
                                     self.evidence["code_files"].append({

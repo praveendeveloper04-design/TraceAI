@@ -207,11 +207,25 @@ class SchemaDiscovery:
                     matched_set.add(full_table)
                     continue
 
-                # Entity is substring of table name
-                if entity_lower in table_name:
-                    matched.append(full_table)
-                    matched_set.add(full_table)
-                    continue
+                # Entity is substring of table name — for short entities,
+                # require word-boundary match to avoid false positives
+                if len(entity_lower) <= 4:
+                    # Short entity: require it at a boundary (start, end, or underscore)
+                    boundary_ok = (
+                        table_name.startswith(entity_lower)
+                        or table_name.endswith(entity_lower)
+                        or f"_{entity_lower}" in f"_{table_name}"  # handles start
+                    )
+                    if boundary_ok and entity_lower != table_name:
+                        matched.append(full_table)
+                        matched_set.add(full_table)
+                        continue
+                else:
+                    # Longer entity: substring match is acceptable
+                    if entity_lower in table_name:
+                        matched.append(full_table)
+                        matched_set.add(full_table)
+                        continue
 
                 # Plural/singular
                 if (
@@ -449,6 +463,7 @@ class InvestigationPlanner:
                     entities=plan.entities,
                     all_schema_tables=all_tables,
                     code_tables=index_code_tables or None,
+                    repo_names=plan.repos or None,
                 )
                 plan.tables = [r.qualified_name for r in ranked]
                 plan.table_ranks = {r.qualified_name: r.rank for r in ranked}

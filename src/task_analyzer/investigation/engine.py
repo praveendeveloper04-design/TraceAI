@@ -1354,12 +1354,22 @@ class InvestigationEngine:
 
         seen_classes = set()
 
+        # Extract repo scope from the investigation plan (if available).
+        # When repos are known, restrict index queries to only those repos,
+        # preventing false positives from unrelated services.
+        repo_names: list[str] | None = None
+        if investigation_plan and getattr(investigation_plan, "repos", None):
+            repo_names = investigation_plan.repos
+            logger.debug("workspace_index_scoped", repos=repo_names)
+
         # Find classes matching entities — grouped by layer
         layer_groups: dict[str, list[dict]] = {}
         for entity in entities:
             if len(entity) < 3:
                 continue
-            classes = self._workspace_index.find_classes_by_entity(entity)
+            classes = self._workspace_index.find_classes_by_entity(
+                entity, repo_names=repo_names,
+            )
             for c in classes[:8]:
                 key = f"{c['repo']}/{c['name']}"
                 if key in seen_classes:
@@ -1403,7 +1413,9 @@ class InvestigationEngine:
         for entity in entities[:8]:
             if len(entity) < 3:
                 continue
-            routes = self._workspace_index.find_api_routes(entity)
+            routes = self._workspace_index.find_api_routes(
+                entity, repo_names=repo_names,
+            )
             for r in routes[:5]:
                 route_line = f"- {r['http_method']} `{r['route_path']}` -> {r['class_name']} (`{r['file_path']}`)"
                 if route_line not in route_sections:
