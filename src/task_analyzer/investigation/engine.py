@@ -1362,6 +1362,24 @@ class InvestigationEngine:
             repo_names = investigation_plan.repos
             logger.debug("workspace_index_scoped", repos=repo_names)
 
+        # Extract service path prefixes for sub-repo filtering.
+        # When a repo contains multiple services (e.g., svc-scheduling, PDIUnitManager),
+        # we prefer classes from the identified service's directory.
+        service_paths: list[str] = []
+        if investigation_plan and getattr(investigation_plan, "systems", None):
+            try:
+                from task_analyzer.investigation.planner import load_system_map
+                smap = load_system_map()
+                for system in investigation_plan.systems:
+                    svc_info = smap.services.get(system, {})
+                    svc_path = svc_info.get("path", "")
+                    if svc_path:
+                        service_paths.append(svc_path.rstrip("/").rstrip("\\"))
+                if service_paths:
+                    logger.debug("workspace_index_service_paths", paths=service_paths)
+            except Exception:
+                pass
+
         # Find classes matching entities — grouped by layer
         layer_groups: dict[str, list[dict]] = {}
         for entity in entities:
@@ -1370,6 +1388,36 @@ class InvestigationEngine:
             classes = self._workspace_index.find_classes_by_entity(
                 entity, repo_names=repo_names,
             )
+            # Skip entities that are too generic — if they saturate the result
+            # limit, they match too many classes to be useful search terms.
+            if len(classes) >= 50:
+                logger.debug(
+                    "entity_too_generic_skipped",
+                    entity=entity,
+                    matches=len(classes),
+                )
+                continue
+
+            # If service paths are known, prefer classes from those paths.
+            # Classes from the target service sort first; others are deprioritized.
+            if service_paths:
+                def _in_service(c: dict) -> bool:
+                    fp = c.get("file_path", "")
+                    return any(fp.startswith(sp) or fp.startswith(sp.replace("/", "\\"))
+                              for sp in service_paths)
+                in_svc = [c for c in classes if _in_service(c)]
+                out_svc = [c for c in classes if not _in_service(c)]
+                # Take all in-service classes + limited out-of-service for context
+                classes = in_svc[:8] + out_svc[:2]
+
+            # For short entities (<=4 chars), only keep boundary matches
+            # to avoid false positives from embedded substrings.
+            # The scoring already sorted boundary matches first, so we
+            # filter out low-scored substring-only matches.
+            if len(entity) <= 4:
+                from task_analyzer.workspace_intelligence.index import _is_word_boundary_match
+                classes = [c for c in classes if _is_word_boundary_match(entity, c["name"])]
+
             for c in classes[:8]:
                 key = f"{c['repo']}/{c['name']}"
                 if key in seen_classes:

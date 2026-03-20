@@ -550,20 +550,13 @@ class WorkspaceIndex:
             0.7 — Prefix match (class name starts with entity)
             0.3 — Substring match (entity embedded in class name)
 
+        For short entities (<=4 chars), substring matches are scored 0.1
+        to heavily deprioritize them since they're likely false positives.
+
         Layer priority is used as a tiebreaker within the same score.
         """
         entity_lower = entity.lower()
-
-        # Regex for PascalCase word-boundary detection.
-        # Matches entity when preceded by start-of-string, a lowercase char,
-        # or a non-alpha char, and followed by end-of-string, an uppercase char,
-        # or a non-alpha char.
-        boundary_re = re.compile(
-            r"(?:^|(?<=[a-z])|(?<=[^a-zA-Z0-9]))"
-            + re.escape(entity)
-            + r"(?:$|(?=[A-Z])|(?=[^a-zA-Z0-9]))",
-            re.IGNORECASE,
-        )
+        is_short = len(entity) <= 4
 
         layer_priority = {
             "api_controller": 0, "service": 1, "handler": 2,
@@ -572,18 +565,19 @@ class WorkspaceIndex:
         }
 
         for r in results:
-            name_lower = r["name"].lower()
+            name = r["name"]
+            name_lower = name.lower()
 
             if name_lower == entity_lower:
                 score = 1.0
-            elif name_lower.startswith(entity_lower) and boundary_re.search(r["name"]):
-                score = 0.8
-            elif boundary_re.search(r["name"]):
+            elif _is_word_boundary_match(entity, name):
+                # True boundary match (uses case-sensitive PascalCase detection)
                 score = 0.8
             elif name_lower.startswith(entity_lower):
                 score = 0.7
             else:
-                score = 0.3
+                # Pure substring — heavily penalize for short entities
+                score = 0.1 if is_short else 0.3
 
             r["_sort_key"] = (-score, layer_priority.get(r.get("layer", "unknown"), 7))
 

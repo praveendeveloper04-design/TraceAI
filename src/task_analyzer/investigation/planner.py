@@ -54,6 +54,33 @@ STOP_WORDS = frozenset({
     "showing", "display", "page", "view", "form", "button", "click",
     "ability", "inability", "feature", "details", "summary",
     "maintenance", "deployment", "configuration", "setting",
+    # Verbs/adjectives that appear in many class names but are not identifiers
+    "create", "created", "creating", "delete", "deleted", "deleting",
+    "updated", "updating", "insert", "inserted", "remove", "removed",
+    "handle", "handled", "handler", "handling", "process", "processed",
+    "send", "sent", "receive", "received", "return", "returned",
+    "start", "started", "stop", "stopped", "run", "running",
+    "fail", "failed", "failing", "success", "successful",
+    "cause", "caused", "causing", "occur", "occurred", "occurring",
+    "correct", "correctly", "incorrect", "incorrectly",
+    "complete", "completed", "pending", "active", "inactive",
+    "enable", "enabled", "disable", "disabled",
+    "valid", "invalid", "validate", "validation",
+    "planned", "actual", "current", "default", "original",
+    "history", "historical", "recent", "previous", "next",
+    "request", "response", "message", "notification",
+    "service", "controller", "manager", "provider", "factory",
+    "model", "entity", "record", "entry", "field", "column",
+    "table", "schema", "database", "query", "command",
+    "config", "option", "parameter", "argument",
+    "sync", "syncing", "async", "batch", "queue", "cache",
+    "load", "loading", "save", "saving", "fetch", "fetching",
+    "connect", "connected", "disconnect", "connection",
+    "error", "exception", "warning", "critical", "debug",
+    "user", "admin", "role", "permission", "access",
+    "file", "path", "directory", "folder", "document",
+    "time", "date", "timestamp", "duration", "interval",
+    "count", "total", "amount", "number", "size", "length",
 })
 
 
@@ -492,10 +519,24 @@ class InvestigationPlanner:
                         plan.systems.append(system)
 
         # Step 5: Match against service names
+        # Check both full service name in text AND entity-to-service matching.
+        # Users often write abbreviations (e.g., "ITM" instead of "ITMServer"),
+        # so we also check if any extracted entity is a prefix of a service name.
         for svc_name in self.system_map.services:
-            if svc_name.lower() in text:
+            svc_lower = svc_name.lower()
+            # Full service name in text (original behavior)
+            if svc_lower in text:
                 if svc_name not in plan.systems:
                     plan.systems.append(svc_name)
+                continue
+            # Entity-to-service matching: check if any entity is a prefix
+            # of the service name (e.g., "ITM" matches "ITMServer")
+            for entity in plan.entities:
+                entity_lower = entity.lower()
+                if len(entity_lower) >= 3 and svc_lower.startswith(entity_lower):
+                    if svc_name not in plan.systems:
+                        plan.systems.append(svc_name)
+                    break
 
         # Step 6: Determine repos from systems
         for system in plan.systems:

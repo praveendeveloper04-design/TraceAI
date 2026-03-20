@@ -94,6 +94,9 @@ class RankedTableSelector:
                 classes = self.index.find_classes_by_entity(
                     entity, repo_names=repo_names,
                 )
+                # Skip entities that match too many classes — too generic
+                if len(classes) >= 20:
+                    continue
                 for cls in classes[:5]:
                     # Find tables referenced by this class
                     tables = self.index.find_tables_referenced_by_class(cls["name"])
